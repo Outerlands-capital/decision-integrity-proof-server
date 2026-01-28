@@ -134,3 +134,8 @@ def commit(req: CommitRequest):
 
     commitment = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     return CommitResponse(commitment_hash=f"sha256:{commitment}")
+
+@app.get("/version")
+def version():
+    return {"version": "commit-enabled-v1"}
+
