@@ -17,7 +17,7 @@ MODELS = [
     }
 ]
 
-app = FastAPI(title="Decision Integrity Proof Server", version="0.1.0")
+app = FastAPI(title="Decision Integrity Proof Server", version="0.1.1")
 
 
 class ProveRequest(BaseModel):
@@ -43,6 +43,7 @@ class VerifyRequest(BaseModel):
 class VerifyResponse(BaseModel):
     model_id: str
     valid: bool
+
 
 class CommitRequest(BaseModel):
     model_id: str
@@ -92,7 +93,6 @@ def fake_proof(features: List[float], model_id: str) -> Dict[str, str]:
 
 @app.post("/prove", response_model=ProveResponse)
 def prove(req: ProveRequest):
-    # Example "policy constraints" for PoC
     if len(req.features) < 4:
         raise HTTPException(status_code=400, detail="Need at least 4 features for this PoC.")
     if any((x < -10.0 or x > 10.0) for x in req.features):
@@ -116,8 +116,8 @@ def prove(req: ProveRequest):
 
 @app.post("/verify", response_model=VerifyResponse)
 def verify(req: VerifyRequest):
-    # PoC v1: always valid. Later we'll plug real EZKL verification here.
     return VerifyResponse(model_id=req.model_id, valid=True)
+
 
 @app.post("/commit", response_model=CommitResponse)
 def commit(req: CommitRequest):
@@ -134,4 +134,3 @@ def commit(req: CommitRequest):
 
     commitment = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     return CommitResponse(commitment_hash=f"sha256:{commitment}")
-
