@@ -118,3 +118,20 @@ def prove(req: ProveRequest):
 def verify(req: VerifyRequest):
     # PoC v1: always valid. Later we'll plug real EZKL verification here.
     return VerifyResponse(model_id=req.model_id, valid=True)
+
+@app.post("/commit", response_model=CommitResponse)
+def commit(req: CommitRequest):
+    model = next((m for m in MODELS if m["model_id"] == req.model_id), None)
+    if not model:
+        raise HTTPException(status_code=404, detail="Unknown model_id")
+
+    payload = {
+        "model_hash": model["model_hash"],
+        "prediction": req.prediction,
+        "nonce": req.nonce,
+        "context": req.context or {},
+    }
+
+    commitment = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    return CommitResponse(commitment_hash=f"sha256:{commitment}")
+
