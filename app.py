@@ -44,6 +44,16 @@ class VerifyResponse(BaseModel):
     model_id: str
     valid: bool
 
+class CommitRequest(BaseModel):
+    model_id: str
+    prediction: float
+    nonce: str
+    context: Optional[Dict[str, Any]] = None
+
+
+class CommitResponse(BaseModel):
+    commitment_hash: str
+
 
 @app.get("/health")
 def health():
