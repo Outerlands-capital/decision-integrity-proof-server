@@ -561,7 +561,8 @@ def ezkl_verify_real(proof_b64: str) -> bool:
 
         compiled_local = _stage_ezkl_defaults_into_dir(tdir)
 
-        out = _run(
+        # If ezkl verify exits 0, it's valid. If not, _run throws.
+        _run(
             [
                 EZKL_BIN,
                 "verify",
@@ -574,9 +575,8 @@ def ezkl_verify_real(proof_b64: str) -> bool:
             ],
             cwd=tdir,
         )
+        return True
 
-        low = out.lower()
-        return ("verified" in low and "true" in low) or ("valid" in low and "true" in low) or ("success" in low)
 
 
 # =========================
