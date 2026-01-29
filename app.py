@@ -1,15 +1,16 @@
 # app.py
 """
-Decision Integrity Proof Server (Real ZK via EZKL 23.0.3)
+Decision Integrity Proof Server (Real ZK via EZKL)
 
-Render runs only:
-  gen-witness -> prove -> verify
+Offline artifacts (Colab):
+  model.ezkl, vk.key, settings.json, model.onnx, kzg17.srs, pk.key (pk is large)
 
-Offline (Colab) produced:
-  model.ezkl, settings.json, model.onnx, vk.key, kzg17.srs, pk.key
+Render runtime:
+  ezkl gen-witness -> ezkl prove -> ezkl verify
 
-We invoke EZKL via CLI: ezkl <cmd>
-Dockerfile installs ezkl into /usr/local/bin/ezkl.
+Notes:
+- This is a demo, not production hardening.
+- We invoke the EZKL CLI as a subprocess.
 """
 
 import base64
@@ -29,7 +30,7 @@ from pydantic import BaseModel, Field
 APP_ENV = os.getenv("APP_ENV", "dev")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "dev-admin-key")
 
-# Demo toggle: corrupt proofs intentionally to show verify failure.
+# Demo toggle: corrupt proofs intentionally to show verification failure
 TAMPER_PROOF = False
 
 DEFAULT_MODEL_HASH = "sha256:geo-escalation-7d-demo-v1"
@@ -53,22 +54,18 @@ MODELS = [
 # EZKL configuration
 # -------------------------
 EZKL_BIN = os.getenv("EZKL_BIN", "ezkl")
-
 EZKL_ARTIFACTS_DIR = Path(os.getenv("EZKL_ARTIFACTS_DIR", "/app/ezkl_artifacts"))
 
-# Runtime-required
+EZKL_MODEL_ONNX = Path(os.getenv("EZKL_MODEL_ONNX", str(EZKL_ARTIFACTS_DIR / "model.onnx")))
+EZKL_SETTINGS = Path(os.getenv("EZKL_SETTINGS", str(EZKL_ARTIFACTS_DIR / "settings.json")))
 EZKL_COMPILED = Path(os.getenv("EZKL_COMPILED", str(EZKL_ARTIFACTS_DIR / "model.ezkl")))
 EZKL_PK = Path(os.getenv("EZKL_PK", str(EZKL_ARTIFACTS_DIR / "pk.key")))
 EZKL_VK = Path(os.getenv("EZKL_VK", str(EZKL_ARTIFACTS_DIR / "vk.key")))
-
-# Optional (but typically present in your repo)
-EZKL_MODEL_ONNX = Path(os.getenv("EZKL_MODEL_ONNX", str(EZKL_ARTIFACTS_DIR / "model.onnx")))
-EZKL_SETTINGS = Path(os.getenv("EZKL_SETTINGS", str(EZKL_ARTIFACTS_DIR / "settings.json")))
 EZKL_SRS = Path(os.getenv("EZKL_SRS", str(EZKL_ARTIFACTS_DIR / "kzg17.srs")))
 
 STRICT_EZKL = os.getenv("STRICT_EZKL", "true").lower() in ("1", "true", "yes")
 
-app = FastAPI(title="Decision Integrity Proof Server", version="0.4.3-real-zk-ezkl-23.0.3")
+app = FastAPI(title="Decision Integrity Proof Server", version="0.4.4-real-zk-ezkl-23.0.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -222,7 +219,7 @@ def _run(cmd: List[str], cwd: Optional[Path] = None) -> str:
             detail={
                 "error": "Command not found",
                 "cmd": cmd,
-                "hint": "Check that ezkl is installed in the container and EZKL_BIN is correct.",
+                "hint": "EZKL binary missing. In Dockerfile we install it to /usr/local/bin/ezkl.",
             },
         )
     except subprocess.CalledProcessError as e:
@@ -261,14 +258,13 @@ def _check_ezkl_ready_or_raise():
             detail={
                 "error": "EZKL artifacts missing (runtime-required).",
                 "missing": missing,
-                "hint": "Runtime requires: model.ezkl, pk.key, vk.key in /app/ezkl_artifacts.",
+                "hint": "Need: model.ezkl, pk.key, vk.key under /app/ezkl_artifacts (or override EZKL_* env vars).",
             },
         )
 
 
 def _write_ezkl_input_json(path: Path, features: List[float]):
-    # Matches your Colab format:
-    # {"input_data": [[f1,f2,f3,f4]]}
+    # Colab format: {"input_data": [[f1,f2,f3,f4]]}
     data = {"input_data": [features[:4]]}
     path.write_text(json.dumps(data, separators=(",", ":")))
 
@@ -365,8 +361,7 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
 
 def ezkl_verify_real(proof_b64: str) -> Dict[str, Any]:
     """
-    EZKL 23.0.3 verify:
-      verify --proof-path proof.json --vk-path vk.key --compiled-circuit model.ezkl
+    verify --proof-path proof.json --vk-path vk.key --compiled-circuit model.ezkl
     """
     _check_ezkl_ready_or_raise()
 
@@ -437,7 +432,7 @@ def health():
 
 @app.get("/version")
 def version():
-    return {"version": "0.4.3-real-zk-ezkl-23.0.3"}
+    return {"version": "0.4.4-real-zk-ezkl-23.0.3"}
 
 
 @app.get("/models")
@@ -455,7 +450,7 @@ def list_models():
 
 
 # =========================
-# Single-phase proof endpoints
+# Proof endpoints
 # =========================
 
 @app.post("/prove", response_model=ProveResponse)
@@ -467,7 +462,7 @@ def prove(req: ProveRequest):
 
     pred = zk.get("prediction", float("nan"))
     if isinstance(pred, (int, float)) and (math.isnan(pred) or math.isinf(pred)):
-        pred = 0.0  # deterministic fallback for demo
+        pred = 0.0
 
     proof_b64 = zk["proof_b64"]
     if TAMPER_PROOF:
