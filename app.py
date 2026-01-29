@@ -1,34 +1,32 @@
 # app.py
 """
-Decision Integrity Proof Server (Real ZK version via EZKL)
+Decision Integrity Proof Server (Real ZK via EZKL 23.0.3)
 
-What changed vs your hash-based PoC:
-- /prove now generates a REAL zkSNARK proof using EZKL (Halo2-based proving inside EZKL)
-- /verify now verifies that proof using the EZKL verifying key
-- prediction returned is taken from the model inference used by EZKL (or optionally re-computed locally)
+This server generates and verifies REAL zk proofs for a deterministic 4->1 sigmoid model
+using EZKL CLI. All heavy artifacts (compile/setup) are done OFFLINE and shipped in.
 
-What you need on disk (generated once, outside this server):
-- ONNX model file
-- EZKL settings.json
-- compiled circuit file (.ezkl)
-- proving key (pk.key)
-- verifying key (vk.key)
+Runtime (Render) only does: gen-witness -> prove -> verify.
 
-This server shells out to the `ezkl` CLI for prove/verify to keep the demo simple.
-(You can later move to a native Rust service or python bindings if desired.)
+Expected runtime artifacts:
+- model.ezkl (compiled circuit)
+- pk.key (proving key)
+- vk.key (verifying key)
+Optional (not required if using compiled circuit flow):
+- model.onnx
+- settings.json
+Optional (nice for reproducibility; not always required at prove-time):
+- kzg17.srs
 
-Environment variables:
+Env:
   APP_ENV=dev
   ADMIN_KEY=...
-  # EZKL
-  EZKL_BIN=ezkl                           # path to ezkl binary in PATH or absolute
-  EZKL_ARTIFACTS_DIR=./ezkl_artifacts     # directory containing artifacts
-  EZKL_MODEL_ONNX=./ezkl_artifacts/model.onnx
-  EZKL_SETTINGS=./ezkl_artifacts/settings.json
-  EZKL_COMPILED=./ezkl_artifacts/model.ezkl
-  EZKL_PK=./ezkl_artifacts/pk.key
-  EZKL_VK=./ezkl_artifacts/vk.key
-  EZKL_SRS=./ezkl_artifacts/kzg.srs       # optional; EZKL can download/generate; prefer pinned file for reproducibility
+  EZKL_BIN=ezkl
+  EZKL_ARTIFACTS_DIR=/app/ezkl_artifacts
+  EZKL_COMPILED=/app/ezkl_artifacts/model.ezkl
+  EZKL_PK=/app/ezkl_artifacts/pk.key
+  EZKL_VK=/app/ezkl_artifacts/vk.key
+  EZKL_SRS=/app/ezkl_artifacts/kzg17.srs
+  STRICT_EZKL=true
 """
 
 import base64
@@ -56,7 +54,7 @@ DEFAULT_MODEL_HASH = "sha256:geo-escalation-7d-demo-v1"
 MODELS = [
     {
         "model_id": "geo_escalation_7d_v1",
-        "description": "Geopolitical escalation risk forecast (next 7 days) — PoC (Real ZK via EZKL)",
+        "description": "Geopolitical escalation risk forecast (next 7 days) — Demo (Real ZK via EZKL)",
         "model_hash": DEFAULT_MODEL_HASH,
         "feature_schema": [
             "analyst_a_assessment",
@@ -73,18 +71,20 @@ MODELS = [
 # -------------------------
 EZKL_BIN = os.getenv("EZKL_BIN", "ezkl")
 EZKL_ARTIFACTS_DIR = Path(os.getenv("EZKL_ARTIFACTS_DIR", "./ezkl_artifacts"))
-EZKL_MODEL_ONNX = Path(os.getenv("EZKL_MODEL_ONNX", str(EZKL_ARTIFACTS_DIR / "model.onnx")))
-EZKL_SETTINGS = Path(os.getenv("EZKL_SETTINGS", str(EZKL_ARTIFACTS_DIR / "settings.json")))
+
+# Runtime-required artifacts
 EZKL_COMPILED = Path(os.getenv("EZKL_COMPILED", str(EZKL_ARTIFACTS_DIR / "model.ezkl")))
 EZKL_PK = Path(os.getenv("EZKL_PK", str(EZKL_ARTIFACTS_DIR / "pk.key")))
 EZKL_VK = Path(os.getenv("EZKL_VK", str(EZKL_ARTIFACTS_DIR / "vk.key")))
-EZKL_SRS = Path(os.getenv("EZKL_SRS", str(EZKL_ARTIFACTS_DIR / "kzg.srs")))
 
-# If True, we will fail-fast if ezkl artifacts are missing.
-# If False, server starts but /prove,/verify will error with actionable message.
+# Optional artifacts (kept for clarity / future extension)
+EZKL_MODEL_ONNX = Path(os.getenv("EZKL_MODEL_ONNX", str(EZKL_ARTIFACTS_DIR / "model.onnx")))
+EZKL_SETTINGS = Path(os.getenv("EZKL_SETTINGS", str(EZKL_ARTIFACTS_DIR / "settings.json")))
+EZKL_SRS = Path(os.getenv("EZKL_SRS", str(EZKL_ARTIFACTS_DIR / "kzg17.srs")))
+
 STRICT_EZKL = os.getenv("STRICT_EZKL", "true").lower() in ("1", "true", "yes")
 
-app = FastAPI(title="Decision Integrity Proof Server", version="0.4.0-real-zk-ezkl")
+app = FastAPI(title="Decision Integrity Proof Server", version="0.4.1-real-zk-ezkl-23.0.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -108,7 +108,7 @@ class ProveRequest(BaseModel):
 class ProveResponse(BaseModel):
     model_id: str
     model_hash: str
-    prediction: float  # probability-like score in [0,1]
+    prediction: float
     proof_b64: str
     public_inputs_b64: str
 
@@ -122,6 +122,7 @@ class VerifyRequest(BaseModel):
 class VerifyResponse(BaseModel):
     model_id: str
     valid: bool
+    detail: Optional[Any] = None
 
 
 class CommitRequest(BaseModel):
@@ -220,26 +221,6 @@ def compute_commitment(model_hash: str, feat_hash_hex: str, nonce: str, context:
     return "sha256:" + hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
-def _check_ezkl_ready_or_raise():
-    missing = []
-    for p in [EZKL_MODEL_ONNX, EZKL_SETTINGS, EZKL_COMPILED, EZKL_PK, EZKL_VK]:
-        if not p.exists():
-            missing.append(str(p))
-    # SRS is optional depending on EZKL config; warn only
-    if missing:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "EZKL artifacts missing. Generate them once and place them on disk.",
-                "missing": missing,
-                "hint": (
-                    "Expected artifacts: model.onnx, settings.json, model.ezkl, pk.key, vk.key. "
-                    "Set EZKL_* env vars if your paths differ."
-                ),
-            },
-        )
-
-
 def _run(cmd: List[str], cwd: Optional[Path] = None) -> str:
     try:
         proc = subprocess.run(
@@ -251,6 +232,15 @@ def _run(cmd: List[str], cwd: Optional[Path] = None) -> str:
             text=True,
         )
         return proc.stdout
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "EZKL binary not found",
+                "hint": "Ensure ezkl is installed in the container and EZKL_BIN is correct.",
+                "EZKL_BIN": EZKL_BIN,
+            },
+        )
     except subprocess.CalledProcessError as e:
         raise HTTPException(
             status_code=500,
@@ -262,53 +252,78 @@ def _run(cmd: List[str], cwd: Optional[Path] = None) -> str:
         )
 
 
+def _check_ezkl_ready_or_raise():
+    missing = []
+    for p in [EZKL_COMPILED, EZKL_PK, EZKL_VK]:
+        if not p.exists():
+            missing.append(str(p))
+
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "EZKL artifacts missing (runtime-required).",
+                "missing": missing,
+                "hint": (
+                    "Runtime requires: model.ezkl, pk.key, vk.key. "
+                    "Verify your Dockerfile copies/downloads these into EZKL_ARTIFACTS_DIR."
+                ),
+            },
+        )
+
+
 def _write_ezkl_input_json(path: Path, features: List[float]):
     """
-    EZKL expects a JSON input file. The exact schema depends on how you compiled your model/settings.
-    The most common format for single input tensor is:
-      {"input_data": [[...]]}
-
-    If your model expects shape [1,4], this should work.
+    Matches the common EZKL input schema used in your Colab:
+      {"input_data": [[f1,f2,f3,f4]]}
     """
     data = {"input_data": [features[:4]]}
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(data, separators=(",", ":")))
 
 
-def _extract_prediction_from_ezkl_witness(witness_json: Dict[str, Any]) -> float:
+def _find_first_scalar(x: Any) -> Optional[float]:
+    # Walk nested lists/dicts to find the first numeric scalar.
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, list) and x:
+        for item in x:
+            v = _find_first_scalar(item)
+            if v is not None:
+                return v
+    if isinstance(x, dict):
+        # common keys to prefer
+        for k in ("outputs", "output_data", "output", "out", "result"):
+            if k in x:
+                v = _find_first_scalar(x[k])
+                if v is not None:
+                    return v
+        # otherwise scan values
+        for v0 in x.values():
+            v = _find_first_scalar(v0)
+            if v is not None:
+                return v
+    return None
+
+
+def _extract_prediction_from_witness_file(witness_path: Path) -> float:
     """
-    This is model-dependent. Common patterns:
-    - witness contains "outputs": [[...]]
-    - or "output_data": [[...]]
-    We'll try a few.
+    EZKL witness.json formats vary. We try to parse and locate the first scalar output.
+    If not found, returns NaN.
     """
-    for key in ("outputs", "output_data", "output"):
-        if key in witness_json:
-            out = witness_json[key]
-            # Try to pull first scalar
-            try:
-                v = out[0][0] if isinstance(out, list) and isinstance(out[0], list) else out[0]
-                return float(v)
-            except Exception:
-                pass
-    # If we can't find it, return NaN-ish and let caller decide
-    return float("nan")
+    try:
+        obj = json.loads(witness_path.read_text())
+    except Exception:
+        return float("nan")
+
+    v = _find_first_scalar(obj)
+    return float(v) if v is not None else float("nan")
 
 
-def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, str]:
+def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
     """
-    Generates a REAL zk proof using EZKL CLI.
-
-    We:
-    - create a temp dir
-    - write input.json
-    - run `ezkl gen-witness` to create witness.json
-    - run `ezkl prove` to create proof.json
-    - run `ezkl verify` optionally (server still exposes /verify)
-
-    We return:
-      proof_b64: base64 of proof.json bytes
-      public_inputs_b64: base64 of the "public instances" (we include witness hash as a stable public fingerprint)
-      prediction: extracted scalar output (caller reads from returned dict)
+    EZKL 23.0.3-compatible flow:
+      gen-witness --data input.json --compiled-circuit model.ezkl --output witness.json
+      prove       --witness witness.json --compiled-circuit model.ezkl --pk-path pk.key --proof-path proof.json
     """
     _check_ezkl_ready_or_raise()
 
@@ -320,26 +335,24 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, str]:
 
         _write_ezkl_input_json(input_path, features)
 
-        # 1) Generate witness (runs the model)
+        # 1) Generate witness (runs inference inside the compiled circuit)
         _run(
             [
                 EZKL_BIN,
                 "gen-witness",
                 "--data",
                 str(input_path),
-                "--model",
-                str(EZKL_MODEL_ONNX),
+                "--compiled-circuit",
+                str(EZKL_COMPILED),
                 "--output",
                 str(witness_path),
             ],
             cwd=tdir,
         )
 
-        witness_obj = json.loads(witness_path.read_text())
-        pred = _extract_prediction_from_ezkl_witness(witness_obj)
+        pred = _extract_prediction_from_witness_file(witness_path)
 
         # 2) Prove
-        # Some EZKL versions use flags: --witness, --compiled-circuit, --pk-path, --proof-path
         _run(
             [
                 EZKL_BIN,
@@ -358,38 +371,33 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, str]:
 
         proof_bytes = proof_path.read_bytes()
 
-        # Public inputs for the verifier are implicitly inside proof + vk in most EZKL flows.
-        # For transport/audit UI we also return a stable public fingerprint:
-        # sha256(model_hash || sha256(features_json))
+        # Stable UI fingerprint (not required by EZKL verify)
         feat_payload = json.dumps(features[:4], separators=(",", ":"), sort_keys=False).encode()
         fh = hashlib.sha256(feat_payload).digest()
         public_fingerprint = hashlib.sha256(model_hash.encode() + fh).digest()
 
-        proof_b64 = base64.b64encode(proof_bytes).decode()
-        public_inputs_b64 = base64.b64encode(public_fingerprint).decode()
-
         return {
-            "proof_b64": proof_b64,
-            "public_inputs_b64": public_inputs_b64,
+            "proof_b64": base64.b64encode(proof_bytes).decode(),
+            "public_inputs_b64": base64.b64encode(public_fingerprint).decode(),
             "prediction": pred,
         }
 
 
-def ezkl_verify_real(proof_b64: str) -> bool:
+def ezkl_verify_real(proof_b64: str) -> Dict[str, Any]:
     """
-    Verifies a REAL zk proof using EZKL CLI.
-
-    We:
-    - decode proof.json bytes
-    - write to temp file
-    - run `ezkl verify` with vk and compiled circuit
+    EZKL 23.0.3 verify:
+      verify --proof-path proof.json --vk-path vk.key --compiled-circuit model.ezkl
     """
     _check_ezkl_ready_or_raise()
 
     with tempfile.TemporaryDirectory() as td:
         tdir = Path(td)
         proof_path = tdir / "proof.json"
-        proof_path.write_bytes(base64.b64decode(proof_b64.encode()))
+
+        try:
+            proof_path.write_bytes(base64.b64decode(proof_b64.encode()))
+        except Exception as e:
+            return {"valid": False, "detail": {"error": "Invalid base64 proof", "exception": str(e)}}
 
         out = _run(
             [
@@ -405,9 +413,19 @@ def ezkl_verify_real(proof_b64: str) -> bool:
             cwd=tdir,
         )
 
-        # EZKL outputs vary by version. We treat presence of "verified" / "true" as success.
         low = out.lower()
-        return ("verified" in low and "true" in low) or ("success" in low) or ("valid" in low and "true" in low)
+        valid = ("verified" in low and "true" in low) or ("valid" in low and "true" in low) or ("success" in low)
+        return {"valid": bool(valid), "detail": {"output": out}}
+
+
+def _artifact_info(p: Path) -> Dict[str, Any]:
+    if not p.exists():
+        return {"exists": False}
+    try:
+        size = p.stat().st_size
+    except Exception:
+        size = None
+    return {"exists": True, "size_bytes": size, "path": str(p)}
 
 
 # =========================
@@ -417,8 +435,9 @@ def ezkl_verify_real(proof_b64: str) -> bool:
 @app.on_event("startup")
 def _startup_checks():
     if STRICT_EZKL:
-        # Fail-fast if artifacts missing (better for demos)
         _check_ezkl_ready_or_raise()
+        # also confirm ezkl runs
+        _ = _run([EZKL_BIN, "--version"])
 
 
 # =========================
@@ -427,12 +446,30 @@ def _startup_checks():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "env": APP_ENV}
+    ezkl_version = None
+    try:
+        ezkl_version = _run([EZKL_BIN, "--version"]).strip()
+    except Exception:
+        ezkl_version = None
+
+    return {
+        "ok": True,
+        "env": APP_ENV,
+        "ezkl_version": ezkl_version,
+        "artifacts": {
+            "compiled": _artifact_info(EZKL_COMPILED),
+            "pk": _artifact_info(EZKL_PK),
+            "vk": _artifact_info(EZKL_VK),
+            "srs": _artifact_info(EZKL_SRS),
+            "onnx": _artifact_info(EZKL_MODEL_ONNX),
+            "settings": _artifact_info(EZKL_SETTINGS),
+        },
+    }
 
 
 @app.get("/version")
 def version():
-    return {"version": "0.4.0-real-zk-ezkl"}
+    return {"version": "0.4.1-real-zk-ezkl-23.0.3"}
 
 
 @app.get("/models")
@@ -460,11 +497,9 @@ def prove(req: ProveRequest):
 
     zk = ezkl_prove_real(model["model_hash"], req.features)
 
-    # If EZKL witness parsing couldn't extract prediction, you can optionally compute locally,
-    # but then the proof attests to the EZKL model output, not your local computation.
-    pred = zk.get("prediction")
-    if pred is None or (isinstance(pred, float) and (math.isnan(pred) or math.isinf(pred))):
-        # last resort: keep demo running but be explicit in logs/UI if you want
+    pred = zk.get("prediction", float("nan"))
+    if isinstance(pred, (int, float)) and (math.isnan(pred) or math.isinf(pred)):
+        # Keep demo alive, but deterministic fallback
         pred = 0.0
 
     proof_b64 = zk["proof_b64"]
@@ -482,20 +517,14 @@ def prove(req: ProveRequest):
 
 @app.post("/verify", response_model=VerifyResponse)
 def verify(req: VerifyRequest):
-    # model_id is used for registry/UX parity; verification uses vk+compiled circuit
-    _ = get_model(req.model_id)
+    _ = get_model(req.model_id)  # registry/UX parity
 
-    try:
-        # We verify the REAL proof. public_inputs_b64 is not required by EZKL verify.
-        # We still accept it for UI consistency and audit fingerprints.
-        valid = ezkl_verify_real(req.proof_b64)
-        return VerifyResponse(model_id=req.model_id, valid=bool(valid))
-    except Exception:
-        return VerifyResponse(model_id=req.model_id, valid=False)
+    res = ezkl_verify_real(req.proof_b64)
+    return VerifyResponse(model_id=req.model_id, valid=bool(res["valid"]), detail=res.get("detail"))
 
 
 # =========================
-# Commitment endpoints (unchanged)
+# Commitment endpoints
 # =========================
 
 @app.post("/commit", response_model=CommitResponse)
@@ -536,8 +565,8 @@ def reveal(req: RevealRequest):
 
     zk = ezkl_prove_real(model["model_hash"], req.features)
 
-    pred = zk.get("prediction")
-    if pred is None or (isinstance(pred, float) and (math.isnan(pred) or math.isinf(pred))):
+    pred = zk.get("prediction", float("nan"))
+    if isinstance(pred, (int, float)) and (math.isnan(pred) or math.isinf(pred)):
         pred = 0.0
 
     proof_b64 = zk["proof_b64"]
