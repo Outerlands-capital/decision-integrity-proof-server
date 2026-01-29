@@ -10,19 +10,28 @@ from pydantic import BaseModel, Field
 APP_ENV = os.getenv("APP_ENV", "dev")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "dev-admin-key")
 
-# Mutable in-memory model registry for PoC (admin endpoint can rotate model_hash)
-MODELS = [
-    {
-        "model_id": "risk_model_v1",
-        "description": "Toy risk score model (PoC)",
-        "model_hash": "sha256:demo-model-hash-v1",
-    }
-]
-
 # Demo toggle: when enabled, server will intentionally corrupt proofs to show verification failures
 TAMPER_PROOF = False
 
-app = FastAPI(title="Decision Integrity Proof Server", version="0.2.0")
+# Mutable in-memory model registry for PoC (admin endpoint can rotate model_hash)
+# SAFE FRAMING: "Geopolitical escalation risk forecast (next 7 days)" using abstracted public indicators.
+MODELS = [
+    {
+        "model_id": "geo_escalation_7d_v1",
+        "description": "Geopolitical escalation risk forecast (next 7 days) — PoC",
+        "model_hash": "sha256:geo-escalation-7d-demo-v1",
+        # Optional: purely descriptive, not used by computation
+        "feature_schema": [
+            "news_escalation_intensity",
+            "diplomatic_tension_index",
+            "event_activity_index",
+            "uncertainty_score",
+        ],
+        "policy_note": "Demo uses abstracted public indicators only. Not operational intelligence.",
+    }
+]
+
+app = FastAPI(title="Decision Integrity Proof Server", version="0.3.0")
 
 
 # =========================
@@ -30,7 +39,7 @@ app = FastAPI(title="Decision Integrity Proof Server", version="0.2.0")
 # =========================
 
 class ProveRequest(BaseModel):
-    model_id: str = Field(..., description="Which model version to use")
+    model_id: str = Field(..., description="Which approved model version to use")
     features: List[float] = Field(..., description="Numeric feature vector (PoC)")
     context: Optional[Dict[str, Any]] = Field(default=None)
 
@@ -38,7 +47,7 @@ class ProveRequest(BaseModel):
 class ProveResponse(BaseModel):
     model_id: str
     model_hash: str
-    prediction: float
+    prediction: float  # probability-like score in [0,1]
     proof_b64: str
     public_inputs_b64: str
 
@@ -122,23 +131,31 @@ def require_admin(x_admin_key: Optional[str]):
 
 
 def enforce_policy_constraints(features: List[float]):
-    # Keep this simple + explicit for PoC
+    # Keep constraints simple + explicit for PoC
     if len(features) < 4:
         raise HTTPException(status_code=400, detail="Need at least 4 features for this PoC.")
     if any((x < -10.0 or x > 10.0) for x in features):
         raise HTTPException(status_code=400, detail="Feature out of allowed range (-10..10).")
 
 
-def model_predict_stub(features: List[float]) -> float:
+def predict_geo_escalation_stub(features: List[float]) -> float:
     """
-    Deterministic toy model for PoC.
-    Returns a score in [0,1].
+    Deterministic toy forecaster for PoC:
+      features[0] = news_escalation_intensity
+      features[1] = diplomatic_tension_index
+      features[2] = event_activity_index
+      features[3] = uncertainty_score  (higher uncertainty reduces confidence)
+    Output: probability-like score in [0,1]
     """
-    weights = [0.4, -0.2, 0.1, 0.05]
+    # Weights chosen only for a stable demo behavior, not for real forecasting
+    w = [0.55, 0.35, 0.45, -0.25]
     s = 0.0
-    for i, x in enumerate(features[: len(weights)]):
-        s += weights[i] * x
-    return max(0.0, min(1.0, 0.5 + s))
+    for i in range(min(len(w), len(features))):
+        s += w[i] * features[i]
+
+    # Center around 0.5 for reasonable looking demos
+    p = 0.5 + 0.2 * s
+    return max(0.0, min(1.0, p))
 
 
 def features_hash_hex(features: List[float]) -> str:
@@ -149,8 +166,10 @@ def features_hash_hex(features: List[float]) -> str:
 def fake_proof_v2(model_hash: str, features: List[float]) -> Dict[str, str]:
     """
     PoC proof scheme with real pass/fail verification:
-      public_inputs = sha256(features)
+
+      public_inputs = sha256(features)  (safe fingerprint of inputs)
       proof         = sha256(model_hash || public_inputs_bytes)
+
     verify() recomputes and compares.
     """
     feat_payload = json.dumps(features, separators=(",", ":"), sort_keys=False).encode()
@@ -195,16 +214,19 @@ def health():
 
 @app.get("/version")
 def version():
-    return {"version": "0.2.0-twophase-admin"}
+    return {"version": "0.3.0-geo-escalation-demo"}
 
 
 @app.get("/models")
 def list_models():
+    # Include metadata useful for UI labeling
     return [
         {
             "model_id": m["model_id"],
-            "description": m["description"],
+            "description": m.get("description", ""),
             "model_hash": m["model_hash"],
+            "feature_schema": m.get("feature_schema", []),
+            "policy_note": m.get("policy_note", ""),
         }
         for m in MODELS
     ]
@@ -219,9 +241,10 @@ def prove(req: ProveRequest):
     model = get_model(req.model_id)
     enforce_policy_constraints(req.features)
 
-    prediction = model_predict_stub(req.features)
-    zk = fake_proof_v2(model["model_hash"], req.features)
+    # PoC: model selection (only one model right now)
+    prediction = predict_geo_escalation_stub(req.features)
 
+    zk = fake_proof_v2(model["model_hash"], req.features)
     if TAMPER_PROOF:
         zk["proof_b64"] = maybe_tamper_proof(zk["proof_b64"])
 
@@ -256,7 +279,7 @@ def verify(req: VerifyRequest):
 def commit(req: CommitRequest):
     """
     Commitment over (model_hash, prediction, nonce, context).
-    Useful, but two-phase commit_case/reveal is the stronger anti-backfill story.
+    Useful for some demos, but commit_case/reveal is the stronger anti-backfill workflow.
     """
     model = get_model(req.model_id)
     payload = {
@@ -298,9 +321,9 @@ def reveal(req: RevealRequest):
     fh = features_hash_hex(req.features)
     commitment = compute_commitment(model["model_hash"], fh, req.nonce, req.context or {})
 
-    prediction = model_predict_stub(req.features)
-    zk = fake_proof_v2(model["model_hash"], req.features)
+    prediction = predict_geo_escalation_stub(req.features)
 
+    zk = fake_proof_v2(model["model_hash"], req.features)
     if TAMPER_PROOF:
         zk["proof_b64"] = maybe_tamper_proof(zk["proof_b64"])
 
