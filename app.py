@@ -1,10 +1,12 @@
 import base64
 import hashlib
 import json
+import math
 import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 APP_ENV = os.getenv("APP_ENV", "dev")
@@ -13,13 +15,16 @@ ADMIN_KEY = os.getenv("ADMIN_KEY", "dev-admin-key")
 # Demo toggle: when enabled, server will intentionally corrupt proofs to show verification failures
 TAMPER_PROOF = False
 
+# Default model hash (used by /admin/reset_demo)
+DEFAULT_MODEL_HASH = "sha256:geo-escalation-7d-demo-v1"
+
 # Mutable in-memory model registry for PoC (admin endpoint can rotate model_hash)
 # SAFE FRAMING: "Geopolitical escalation risk forecast (next 7 days)" using abstracted public indicators.
 MODELS = [
     {
         "model_id": "geo_escalation_7d_v1",
         "description": "Geopolitical escalation risk forecast (next 7 days) — PoC",
-        "model_hash": "sha256:geo-escalation-7d-demo-v1",
+        "model_hash": DEFAULT_MODEL_HASH,
         # Optional: purely descriptive, not used by computation
         "feature_schema": [
             "news_escalation_intensity",
@@ -31,7 +36,16 @@ MODELS = [
     }
 ]
 
-app = FastAPI(title="Decision Integrity Proof Server", version="0.3.0")
+app = FastAPI(title="Decision Integrity Proof Server", version="0.3.1")
+
+# Helpful for Base44 browser calls (safe for PoC). Tighten origins in production.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # =========================
@@ -126,6 +140,7 @@ def get_model(model_id: str) -> Dict[str, Any]:
 
 
 def require_admin(x_admin_key: Optional[str]):
+    # FastAPI header param x_admin_key maps to header "X-Admin-Key"
     if x_admin_key != ADMIN_KEY:
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -145,16 +160,18 @@ def predict_geo_escalation_stub(features: List[float]) -> float:
       features[1] = diplomatic_tension_index
       features[2] = event_activity_index
       features[3] = uncertainty_score  (higher uncertainty reduces confidence)
-    Output: probability-like score in [0,1]
+
+    Output: probability-like score in [0,1].
+    NOTE: This is NOT trained and NOT intended to be accurate.
     """
-    # Weights chosen only for a stable demo behavior, not for real forecasting
+    # Weights chosen only for stable demo behavior, not for real forecasting
     w = [0.55, 0.35, 0.45, -0.25]
     s = 0.0
     for i in range(min(len(w), len(features))):
         s += w[i] * features[i]
 
-    # Center around 0.5 for reasonable looking demos
-    p = 0.5 + 0.2 * s
+    # Sigmoid squash into (0,1) like a probability
+    p = 1.0 / (1.0 + math.exp(-s))
     return max(0.0, min(1.0, p))
 
 
@@ -214,7 +231,7 @@ def health():
 
 @app.get("/version")
 def version():
-    return {"version": "0.3.0-geo-escalation-demo"}
+    return {"version": "0.3.1-geo-escalation-demo"}
 
 
 @app.get("/models")
@@ -241,7 +258,6 @@ def prove(req: ProveRequest):
     model = get_model(req.model_id)
     enforce_policy_constraints(req.features)
 
-    # PoC: model selection (only one model right now)
     prediction = predict_geo_escalation_stub(req.features)
 
     zk = fake_proof_v2(model["model_hash"], req.features)
@@ -361,3 +377,24 @@ def admin_set_model_hash(req: AdminSetModelHashRequest, x_admin_key: Optional[st
             m["model_hash"] = req.model_hash
             return {"ok": True, "model_id": req.model_id, "model_hash": req.model_hash}
     raise HTTPException(status_code=404, detail="Unknown model_id")
+
+
+@app.post("/admin/reset_demo")
+def admin_reset_demo(x_admin_key: Optional[str] = Header(None)):
+    """
+    Convenience endpoint for demos:
+    - turns off proof tampering
+    - resets model hash to the default
+    """
+    require_admin(x_admin_key)
+    global TAMPER_PROOF
+    TAMPER_PROOF = False
+    for m in MODELS:
+        if m["model_id"] == "geo_escalation_7d_v1":
+            m["model_hash"] = DEFAULT_MODEL_HASH
+    return {
+        "ok": True,
+        "tamper_proof": TAMPER_PROOF,
+        "model_id": "geo_escalation_7d_v1",
+        "model_hash": get_model("geo_escalation_7d_v1")["model_hash"],
+    }
