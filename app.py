@@ -343,16 +343,23 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
         _write_ezkl_input_json(input_path, features)
 
         # 1) Witness
+        # Your Render EZKL version does NOT support:
+        #   ezkl gen-witness --data <DATA> --model <MODEL> --output <OUT>
+        # It expects:
+        #   ezkl gen-witness --data <DATA>
+        # and relies on default artifact filenames in the current working directory.
+        #
+        # So we copy the artifacts into this temp dir and run gen-witness there.
+        (tdir / "model.onnx").write_bytes(EZKL_MODEL_ONNX.read_bytes())
+        (tdir / "settings.json").write_bytes(EZKL_SETTINGS.read_bytes())
+        (tdir / "model.ezkl").write_bytes(EZKL_COMPILED.read_bytes())
+
         _run(
             [
                 EZKL_BIN,
                 "gen-witness",
                 "--data",
                 str(input_path),
-                "--model",
-                str(EZKL_MODEL_ONNX),
-                "--output",
-                str(witness_path),
             ],
             cwd=tdir,
         )
