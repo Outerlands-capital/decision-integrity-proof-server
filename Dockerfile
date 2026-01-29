@@ -1,38 +1,73 @@
+# Dockerfile
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps
+# --- System deps ---
+# curl + ca-certificates for downloads, tar/gzip for EZKL installer, file for sanity checks (optional)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates file \
+    curl ca-certificates tar gzip file \
   && rm -rf /var/lib/apt/lists/*
 
-# ---- Install EZKL binary (v23.0.3) from GitHub releases ----
-# Important: use -f (fail on HTTP error) and verify it's a Linux ELF binary.
-ARG EZKL_VERSION=23.0.3
+# --- Install EZKL CLI (pinned) using official installer script ---
+# The script downloads the correct build-artifacts tarball for the platform/arch.
+# We install into /opt/ezkl and symlink to /usr/local/bin/ezkl.
+ARG EZKL_TAG=v23.0.3
+ENV EZKL_DIR=/opt/ezkl
 RUN set -eux; \
-    curl -fL -o /usr/local/bin/ezkl \
-      https://github.com/zkonduit/ezkl/releases/download/v${EZKL_VERSION}/ezkl-linux-amd64; \
-    chmod +x /usr/local/bin/ezkl; \
-    file /usr/local/bin/ezkl | grep -E "ELF 64-bit LSB executable"; \
-    /usr/local/bin/ezkl --version
+    mkdir -p "${EZKL_DIR}"; \
+    curl -fsSL https://raw.githubusercontent.com/zkonduit/ezkl/main/install_ezkl_cli.sh | bash -s -- "${EZKL_TAG}"; \
+    # The installer puts the binary into $EZKL_DIR/ezkl
+    test -x "${EZKL_DIR}/ezkl"; \
+    ln -sf "${EZKL_DIR}/ezkl" /usr/local/bin/ezkl; \
+    ezkl --version
 
-# Python deps
+# --- Python deps ---
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# App
+# --- App code ---
 COPY app.py /app/app.py
 
-# Artifacts (repo contains all but pk.key)
-COPY ezkl_artifacts /app/ezkl_artifacts
+# --- EZKL artifacts folder (we'll populate it by downloading from GitHub Release) ---
+RUN mkdir -p /app/ezkl_artifacts
 
-# Download pk.key from GitHub Release (big file)
+# Provide URLs at build time (recommended) OR runtime (fallback handled in app.py)
+# Example:
+#   --build-arg MODEL_ONNX_URL=...
+#   --build-arg SETTINGS_URL=...
+#   --build-arg COMPILED_URL=...
+#   --build-arg PK_URL=...
+#   --build-arg VK_URL=...
+#   --build-arg SRS_URL=...
+ARG MODEL_ONNX_URL=""
+ARG SETTINGS_URL=""
+ARG COMPILED_URL=""
+ARG PK_URL=""
+ARG VK_URL=""
+ARG SRS_URL=""
+
+# Download artifacts if URLs were provided at build time
 RUN set -eux; \
-    mkdir -p /app/ezkl_artifacts; \
-    curl -fL -o /app/ezkl_artifacts/pk.key \
-      https://github.com/Outerlands-capital/decision-integrity-proof-server/releases/download/artifacts-v1/pk.key; \
-    test -s /app/ezkl_artifacts/pk.key
+    dl () { \
+      url="$1"; out="$2"; \
+      if [ -n "$url" ]; then \
+        echo "Downloading $url -> $out"; \
+        curl -fL "$url" -o "$out"; \
+      else \
+        echo "Skipping $out (no URL provided)"; \
+      fi; \
+    }; \
+    dl "${MODEL_ONNX_URL}" /app/ezkl_artifacts/model.onnx; \
+    dl "${SETTINGS_URL}"   /app/ezkl_artifacts/settings.json; \
+    dl "${COMPILED_URL}"   /app/ezkl_artifacts/model.ezkl; \
+    dl "${PK_URL}"         /app/ezkl_artifacts/pk.key; \
+    dl "${VK_URL}"         /app/ezkl_artifacts/vk.key; \
+    dl "${SRS_URL}"        /app/ezkl_artifacts/kzg17.srs; \
+    true
 
+# Render uses PORT; expose for local
 EXPOSE 8080
+ENV PORT=8080
+
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
