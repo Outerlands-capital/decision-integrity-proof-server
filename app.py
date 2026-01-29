@@ -34,10 +34,9 @@ Option 2 (server-side only, no API changes):
 - On /reveal, enforce that the CURRENT model hash equals the model hash at commit time.
   If model hash was rotated after commit -> commitment_matches becomes false.
 
-FIXES:
-- Make verify deterministic on Render by using staged default filenames in the temp working dir
-  (vk.key + model.compiled + settings.json + srs staged into cwd), and using relative paths.
-- Log verify failures to Render logs without changing API schemas.
+Important EZKL constraint (Render / ezkl 23.0.3):
+- `ezkl verify` DOES NOT accept `--compiled-circuit` in this version.
+  Usage: ezkl verify --proof-path <...> --vk-path <...>
 """
 
 import base64
@@ -97,6 +96,7 @@ def _prune_commit_db(now: Optional[float] = None):
         for k in to_delete:
             del COMMIT_DB[k]
 
+
 # -------------------------
 # EZKL configuration
 # -------------------------
@@ -115,7 +115,7 @@ EZKL_SRS_URL = os.getenv("EZKL_SRS_URL", "").strip()
 
 STRICT_EZKL = os.getenv("STRICT_EZKL", "true").lower() in ("1", "true", "yes")
 
-app = FastAPI(title="Decision Integrity Proof Server", version="0.4.2-real-zk-ezkl")
+app = FastAPI(title="Decision Integrity Proof Server", version="0.4.3-real-zk-ezkl")
 
 app.add_middleware(
     CORSMiddleware,
@@ -336,8 +336,7 @@ def _run(cmd: List[str], cwd: Optional[Path] = None) -> str:
 
 
 def _write_ezkl_input_json(path: Path, features: List[float]):
-    # Model expects shape [1,4]
-    data = {"input_data": [features[:4]]}
+    data = {"input_data": [features[:4]]}  # shape [1,4]
     path.write_text(json.dumps(data))
 
 
@@ -355,12 +354,11 @@ def _extract_prediction_from_ezkl_witness(witness_json: Dict[str, Any]) -> float
 
 def _stage_ezkl_defaults_into_dir(dst_dir: Path) -> Path:
     """
-    Render EZKL constraint: gen-witness expects default filenames in cwd.
-    We stage artifacts into a temp dir with expected filenames:
+    Stage artifacts into a temp dir with expected filenames:
       - model.compiled (from model.ezkl)
       - settings.json
       - model.onnx
-      - pk.key / vk.key / kzg17.srs (also staged for convenience)
+      - pk.key / vk.key / kzg17.srs
     """
     (dst_dir / "settings.json").write_bytes(EZKL_SETTINGS.read_bytes())
 
@@ -376,7 +374,7 @@ def _stage_ezkl_defaults_into_dir(dst_dir: Path) -> Path:
     if EZKL_SRS.exists():
         (dst_dir / "kzg17.srs").write_bytes(EZKL_SRS.read_bytes())
 
-    # Some builds look for /root/.ezkl/srs/kzg15.srs by default; try to populate if we can.
+    # Some builds look for /root/.ezkl/srs/kzg15.srs by default; populate if possible.
     try:
         srs_src = dst_dir / "kzg17.srs"
         if srs_src.exists():
@@ -558,10 +556,11 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
 
 def ezkl_verify_real(proof_b64: str) -> bool:
     """
-    IMPORTANT:
-    Render's EZKL builds can be sensitive to filenames + cwd.
-    We stage vk.key + model.compiled (+ settings/model/srs) into a temp cwd and
-    run verify using RELATIVE paths in that cwd to avoid brittle path resolution.
+    ezkl 23.0.3 verify signature (as seen in logs):
+      ezkl verify --proof-path <PROOF_PATH> --vk-path <VK_PATH>
+
+    No --compiled-circuit here.
+    We still stage vk.key into cwd and use relative paths for Render stability.
     """
     _check_ezkl_ready_or_raise()
 
@@ -572,7 +571,6 @@ def ezkl_verify_real(proof_b64: str) -> bool:
 
         _stage_ezkl_defaults_into_dir(tdir)
 
-        # If ezkl verify exits 0, it's valid. If not, _run throws.
         _run(
             [
                 EZKL_BIN,
@@ -581,8 +579,6 @@ def ezkl_verify_real(proof_b64: str) -> bool:
                 "proof.json",
                 "--vk-path",
                 "vk.key",
-                "--compiled-circuit",
-                "model.compiled",
             ],
             cwd=tdir,
         )
@@ -610,7 +606,7 @@ def health():
 
 @app.get("/version")
 def version():
-    return {"version": "0.4.2-real-zk-ezkl"}
+    return {"version": "0.4.3-real-zk-ezkl"}
 
 
 @app.get("/models")
@@ -696,7 +692,6 @@ def commit_case(req: CommitCaseRequest):
     fh = features_hash_hex(req.features[:4])
     commitment = compute_commitment(model["model_hash"], fh, req.nonce, req.context or {})
 
-    # Option 2: store commit record (server-side, no API changes)
     _prune_commit_db()
     context_hash = hashlib.sha256(json.dumps(req.context or {}, sort_keys=True).encode()).hexdigest()
     with COMMIT_DB_LOCK:
@@ -719,10 +714,8 @@ def reveal(req: RevealRequest):
 
     fh = features_hash_hex(req.features[:4])
 
-    # Compute commitment using CURRENT model hash (used only for fallback & returning commitment_hash)
     computed_now = compute_commitment(model["model_hash"], fh, req.nonce, req.context or {})
 
-    # Option 2 enforcement:
     _prune_commit_db()
     with COMMIT_DB_LOCK:
         record = COMMIT_DB.get(req.expected_commitment_hash)
@@ -738,7 +731,6 @@ def reveal(req: RevealRequest):
         matches = bool(model_hash_ok and features_ok and nonce_ok and context_ok)
         commitment_to_return = req.expected_commitment_hash
     else:
-        # Fallback behavior (e.g., server restarted and lost COMMIT_DB)
         matches = (computed_now == req.expected_commitment_hash)
         commitment_to_return = computed_now
 
