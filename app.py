@@ -331,6 +331,30 @@ def _extract_prediction_from_ezkl_witness(witness_json: Dict[str, Any]) -> float
     return float("nan")
 
 
+def _stage_ezkl_defaults_into_dir(dst_dir: Path) -> Path:
+    """
+    Some EZKL CLI versions expect default artifact filenames in the current working directory.
+    Based on your Render error, gen-witness is looking for: model.compiled
+
+    We stage/copy your repo artifacts into dst_dir using the expected default names:
+      - model.compiled  (from EZKL_COMPILED which is ./ezkl_artifacts/model.ezkl)
+      - settings.json
+      - model.onnx      (safe to include even if not required)
+    Returns the path to the staged compiled circuit.
+    """
+    # settings.json
+    (dst_dir / "settings.json").write_bytes(EZKL_SETTINGS.read_bytes())
+
+    # compiled circuit expected as model.compiled
+    compiled_local = dst_dir / "model.compiled"
+    compiled_local.write_bytes(EZKL_COMPILED.read_bytes())
+
+    # model.onnx (some flows still read this; harmless to stage)
+    (dst_dir / "model.onnx").write_bytes(EZKL_MODEL_ONNX.read_bytes())
+
+    return compiled_local
+
+
 def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
     _check_ezkl_ready_or_raise()
 
@@ -340,29 +364,26 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
         witness_path = tdir / "witness.json"
         proof_path = tdir / "proof.json"
 
+        # Stage artifacts in the temp dir under default filenames expected by EZKL CLI on Render
+        compiled_local = _stage_ezkl_defaults_into_dir(tdir)
+
+        # Write inputs
         _write_ezkl_input_json(input_path, features)
 
-        # 1) Witness
-        # Your Render EZKL version does NOT support:
-        #   ezkl gen-witness --data <DATA> --model <MODEL> --output <OUT>
-        # It expects:
-        #   ezkl gen-witness --data <DATA>
-        # and relies on default artifact filenames in the current working directory.
-        #
-        # So we copy the artifacts into this temp dir and run gen-witness there.
-        # 1) Witness (newer EZKL CLI: uses defaults in CWD; no --model / --output)
-        # Copy artifacts into the temp working dir so EZKL can find default filenames.
-        (tdir / "model.onnx").write_bytes(EZKL_MODEL_ONNX.read_bytes())
-        (tdir / "settings.json").write_bytes(EZKL_SETTINGS.read_bytes())
-        (tdir / "model.ezkl").write_bytes(EZKL_COMPILED.read_bytes())
-        
-        # inputs already written to input_path
-        _run([EZKL_BIN, "gen-witness", "--data", str(input_path)], cwd=tdir)
-        
-        # EZKL will emit witness.json in cwd
+        # 1) Witness (Render EZKL expects: ezkl gen-witness --data <DATA>)
+        _run(
+            [
+                EZKL_BIN,
+                "gen-witness",
+                "--data",
+                str(input_path),
+            ],
+            cwd=tdir,
+        )
+
+        # EZKL writes witness.json in cwd
         witness_obj = json.loads(witness_path.read_text())
         pred = _extract_prediction_from_ezkl_witness(witness_obj)
-
 
         # 2) Prove
         _run(
@@ -372,7 +393,7 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
                 "--witness",
                 str(witness_path),
                 "--compiled-circuit",
-                str(EZKL_COMPILED),
+                str(compiled_local),
                 "--pk-path",
                 str(EZKL_PK),
                 "--proof-path",
@@ -403,6 +424,9 @@ def ezkl_verify_real(proof_b64: str) -> bool:
         proof_path = tdir / "proof.json"
         proof_path.write_bytes(base64.b64decode(proof_b64.encode()))
 
+        # Stage the compiled circuit under the default filename; also use it explicitly in flags.
+        compiled_local = _stage_ezkl_defaults_into_dir(tdir)
+
         out = _run(
             [
                 EZKL_BIN,
@@ -412,7 +436,7 @@ def ezkl_verify_real(proof_b64: str) -> bool:
                 "--vk-path",
                 str(EZKL_VK),
                 "--compiled-circuit",
-                str(EZKL_COMPILED),
+                str(compiled_local),
             ],
             cwd=tdir,
         )
@@ -563,7 +587,7 @@ def reveal(req: RevealRequest):
 # =========================
 
 @app.post("/admin/tamper_proof")
-def admin_tamper_proof(req: AdminToggleRequest, x_admin_key: Optional[str] = Header(None)):
+def admin_tamper_proof(req: "AdminToggleRequest", x_admin_key: Optional[str] = Header(None)):
     require_admin(x_admin_key)
     global TAMPER_PROOF
     TAMPER_PROOF = req.enabled
@@ -571,7 +595,7 @@ def admin_tamper_proof(req: AdminToggleRequest, x_admin_key: Optional[str] = Hea
 
 
 @app.post("/admin/set_model_hash")
-def admin_set_model_hash(req: AdminSetModelHashRequest, x_admin_key: Optional[str] = Header(None)):
+def admin_set_model_hash(req: "AdminSetModelHashRequest", x_admin_key: Optional[str] = Header(None)):
     require_admin(x_admin_key)
     for m in MODELS:
         if m["model_id"] == req.model_id:
