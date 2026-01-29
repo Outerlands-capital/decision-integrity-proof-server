@@ -6,7 +6,7 @@ Decision Integrity Proof Server (Real ZK version via EZKL)
 - /verify verifies it using vk.key
 
 Artifacts:
-- model.onnx, settings.json, model.ezkl, vk.key are in repo under ./ezkl_artifacts
+- model.onnx, settings.json, model.ezkl, vk.key, kzg17.srs are in repo under ./ezkl_artifacts
 - pk.key is LARGE, so it is downloaded at runtime from EZKL_PK_URL if missing
 
 Env:
@@ -27,6 +27,12 @@ Env:
   # URLs (used if local file missing)
   EZKL_PK_URL=https://.../pk.key
   EZKL_SRS_URL=https://.../kzg17.srs   (optional)
+
+Notes:
+- Render's EZKL may differ. We:
+  1) ensure a CLI that supports gen-witness (install into /tmp if needed)
+  2) stage default filenames into a temp cwd for each request
+  3) ensure default SRS paths exist (EZKL may try /root/.ezkl/srs/kzg15.srs)
 """
 
 import base64
@@ -34,11 +40,9 @@ import hashlib
 import json
 import math
 import os
+import stat
 import subprocess
 import tempfile
-import stat
-import platform
-
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -76,23 +80,18 @@ MODELS = [
 # EZKL configuration
 # -------------------------
 EZKL_BIN = os.getenv("EZKL_BIN", "ezkl")
-EZKL_ARTIFACTS_DIR = Path(os.getenv("EZKL_ARTIFACTS_DIR", "./ezkl_artifacts"))
 
 EZKL_ARTIFACTS_DIR = Path(os.getenv("EZKL_ARTIFACTS_DIR", "./ezkl_artifacts")).resolve()
-
 EZKL_MODEL_ONNX = Path(os.getenv("EZKL_MODEL_ONNX", str(EZKL_ARTIFACTS_DIR / "model.onnx"))).resolve()
-EZKL_SETTINGS   = Path(os.getenv("EZKL_SETTINGS",   str(EZKL_ARTIFACTS_DIR / "settings.json"))).resolve()
-EZKL_COMPILED   = Path(os.getenv("EZKL_COMPILED",   str(EZKL_ARTIFACTS_DIR / "model.ezkl"))).resolve()
-EZKL_PK         = Path(os.getenv("EZKL_PK",         str(EZKL_ARTIFACTS_DIR / "pk.key"))).resolve()
-EZKL_VK         = Path(os.getenv("EZKL_VK",         str(EZKL_ARTIFACTS_DIR / "vk.key"))).resolve()
-EZKL_SRS        = Path(os.getenv("EZKL_SRS",        str(EZKL_ARTIFACTS_DIR / "kzg17.srs"))).resolve()
+EZKL_SETTINGS = Path(os.getenv("EZKL_SETTINGS", str(EZKL_ARTIFACTS_DIR / "settings.json"))).resolve()
+EZKL_COMPILED = Path(os.getenv("EZKL_COMPILED", str(EZKL_ARTIFACTS_DIR / "model.ezkl"))).resolve()
+EZKL_PK = Path(os.getenv("EZKL_PK", str(EZKL_ARTIFACTS_DIR / "pk.key"))).resolve()
+EZKL_VK = Path(os.getenv("EZKL_VK", str(EZKL_ARTIFACTS_DIR / "vk.key"))).resolve()
+EZKL_SRS = Path(os.getenv("EZKL_SRS", str(EZKL_ARTIFACTS_DIR / "kzg17.srs"))).resolve()
 
-
-# URLs for missing artifacts (pk is the important one for you)
 EZKL_PK_URL = os.getenv("EZKL_PK_URL", "").strip()
 EZKL_SRS_URL = os.getenv("EZKL_SRS_URL", "").strip()
 
-# Fail-fast on startup if required artifacts are missing (after attempting downloads)
 STRICT_EZKL = os.getenv("STRICT_EZKL", "true").lower() in ("1", "true", "yes")
 
 app = FastAPI(title="Decision Integrity Proof Server", version="0.4.2-real-zk-ezkl")
@@ -115,7 +114,6 @@ class ApiModel(BaseModel):
 # =========================
 # Request/Response Models
 # =========================
-
 class ProveRequest(ApiModel):
     model_id: str = Field(..., description="Which approved model version to use")
     features: List[float] = Field(..., description="Numeric feature vector")
@@ -195,7 +193,6 @@ class AdminSetModelHashRequest(ApiModel):
 # =========================
 # Helpers
 # =========================
-
 def get_model(model_id: str) -> Dict[str, Any]:
     model = next((m for m in MODELS if m["model_id"] == model_id), None)
     if not model:
@@ -268,9 +265,7 @@ def _ensure_artifact(path: Path, url: str, label: str):
 
 
 def _maybe_fetch_missing_artifacts():
-    # Only pk is required in your setup (others are in repo)
     _ensure_artifact(EZKL_PK, EZKL_PK_URL, "pk.key")
-    # SRS optional, but if you want to pin it, set EZKL_SRS_URL
     _ensure_artifact(EZKL_SRS, EZKL_SRS_URL, "kzg17.srs")
 
 
@@ -288,7 +283,7 @@ def _check_ezkl_ready_or_raise():
                 "error": "EZKL artifacts missing",
                 "missing": missing,
                 "hint": (
-                    "Put model.onnx/settings.json/model.ezkl/vk.key in ./ezkl_artifacts and "
+                    "Put model.onnx/settings.json/model.ezkl/vk.key,kzg17.srs in ./ezkl_artifacts and "
                     "either provide pk.key on disk or set EZKL_PK_URL so the server downloads it."
                 ),
             },
@@ -318,7 +313,6 @@ def _run(cmd: List[str], cwd: Optional[Path] = None) -> str:
 
 
 def _write_ezkl_input_json(path: Path, features: List[float]):
-    # Model expects shape [1,4]
     data = {"input_data": [features[:4]]}
     path.write_text(json.dumps(data))
 
@@ -336,6 +330,9 @@ def _extract_prediction_from_ezkl_witness(witness_json: Dict[str, Any]) -> float
 
 
 def _stage_ezkl_defaults_into_dir(dst_dir: Path) -> Path:
+    """
+    Stage/copy artifacts into a temp working directory using filenames that Render's EZKL expects.
+    """
     (dst_dir / "settings.json").write_bytes(EZKL_SETTINGS.read_bytes())
 
     compiled_local = dst_dir / "model.compiled"
@@ -353,7 +350,136 @@ def _stage_ezkl_defaults_into_dir(dst_dir: Path) -> Path:
     return compiled_local
 
 
+def _ensure_default_srs_files():
+    """
+    Your Render error shows EZKL is trying to load:
+      /root/.ezkl/srs/kzg15.srs
 
+    In Colab you fixed this by copying kzg17.srs into the default SRS dir as BOTH kzg15.srs and kzg17.srs.
+    We do the same here, and we also cover HOME=/tmp (used by our installer) just in case.
+    """
+    if not EZKL_SRS.exists():
+        if STRICT_EZKL:
+            raise RuntimeError(f"Missing SRS file at {EZKL_SRS}")
+        print(f"[startup] SRS not found at {EZKL_SRS} (STRICT_EZKL off) — skipping default SRS pin")
+        return
+
+    srs_bytes = EZKL_SRS.read_bytes()
+
+    candidates = [
+        Path("/root/.ezkl/srs"),
+        Path.home() / ".ezkl" / "srs",
+        Path("/tmp/.ezkl/srs"),
+    ]
+
+    wrote_any = False
+    for d in candidates:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "kzg15.srs").write_bytes(srs_bytes)
+            (d / "kzg17.srs").write_bytes(srs_bytes)
+            wrote_any = True
+        except Exception as e:
+            print(f"[startup] could not write SRS defaults into {d}: {e}")
+
+    if wrote_any:
+        print("[startup] ensured default SRS files (kzg15.srs and kzg17.srs) in common EZKL locations")
+
+
+# =========================
+# EZKL CLI self-heal (if Render has a different/old ezkl on PATH)
+# =========================
+def _which(cmd: str) -> Optional[str]:
+    from shutil import which
+    return which(cmd)
+
+
+def _run_no_throw(cmd: List[str]) -> str:
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return (proc.stdout or "").strip()
+
+
+def _ezkl_has_gen_witness(ezkl_bin: str) -> bool:
+    out = _run_no_throw([ezkl_bin, "--help"]).lower()
+    return "gen-witness" in out or "gen_witness" in out
+
+
+def _install_ezkl_cli_into_tmp() -> str:
+    install_url = os.getenv(
+        "EZKL_INSTALL_SCRIPT_URL",
+        "https://raw.githubusercontent.com/zkonduit/ezkl/main/install_ezkl_cli.sh",
+    )
+
+    tmp_dir = Path("/tmp/.ezkl_installer")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    script_path = tmp_dir / "install_ezkl_cli.sh"
+
+    req = urllib.request.Request(install_url, headers={"User-Agent": "decision-integrity-proof-server/1.0"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        script_path.write_bytes(r.read())
+
+    script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC)
+
+    # Force HOME to /tmp to avoid permission/path weirdness on Render.
+    env = {**os.environ, "HOME": "/tmp"}
+    proc = subprocess.run(
+        ["bash", str(script_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"EZKL install script failed:\n{proc.stdout}")
+
+    candidates = [
+        Path("/tmp/.ezkl/ezkl"),
+        Path("/root/.ezkl/ezkl"),
+    ]
+    for c in candidates:
+        if c.exists():
+            c.chmod(c.stat().st_mode | stat.S_IEXEC)
+            return str(c)
+
+    found = _which("ezkl")
+    if found:
+        return found
+
+    raise RuntimeError("EZKL install finished but ezkl binary not found in expected locations.")
+
+
+def _ensure_working_ezkl_cli():
+    global EZKL_BIN
+
+    current = EZKL_BIN
+    if not os.path.isabs(current):
+        resolved = _which(current)
+        if resolved:
+            current = resolved
+
+    if current and Path(current).exists() and _ezkl_has_gen_witness(current):
+        EZKL_BIN = current
+        print(f"[startup] ezkl ok: {EZKL_BIN} | version: {_run_no_throw([EZKL_BIN, '--version'])}")
+        return
+
+    print("[startup] ezkl missing gen-witness (or not found). Installing EZKL CLI into /tmp ...")
+    installed = _install_ezkl_cli_into_tmp()
+
+    if not _ezkl_has_gen_witness(installed):
+        raise RuntimeError(f"Installed ezkl still missing gen-witness: {installed}")
+
+    EZKL_BIN = installed
+    print(f"[startup] using installed ezkl: {EZKL_BIN} | version: {_run_no_throw([EZKL_BIN, '--version'])}")
+
+
+# =========================
+# EZKL core functions
+# =========================
 def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
     _check_ezkl_ready_or_raise()
 
@@ -364,14 +490,10 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
         witness_path = tdir / "witness.json"
         proof_path = tdir / "proof.json"
 
-        # Stage artifacts in the temp dir under default filenames expected by EZKL CLI on Render
-        compiled_local = _stage_ezkl_defaults_into_dir(tdir)
-
-        # Write inputs (EZKL reads input.json from cwd in some builds; we keep it in cwd)
+        _stage_ezkl_defaults_into_dir(tdir)
         _write_ezkl_input_json(input_path, features)
 
-        # 1) Witness (Render EZKL expects defaults in cwd; flags vary by build)
-        # Try with --data first, then fallback to bare command if unsupported.
+        # 1) Witness
         try:
             _run([EZKL_BIN, "gen-witness", "--data", "input.json"], cwd=tdir)
         except HTTPException:
@@ -390,11 +512,9 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
         pred = _extract_prediction_from_ezkl_witness(witness_obj)
 
         # 2) Prove
-        # IMPORTANT: use an absolute pk path (or staged pk.key in cwd) so cwd doesn't break it.
         pk_local = tdir / "pk.key"
         pk_path = pk_local if pk_local.exists() else EZKL_PK.resolve()
 
-        # Some builds may also want srs in cwd; if staged, it'll be there.
         _run(
             [
                 EZKL_BIN,
@@ -422,7 +542,6 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
 
         proof_bytes = proof_path.read_bytes()
 
-        # Optional "public fingerprint" for your UI (kept exactly as your current logic)
         feat_payload = json.dumps(features[:4], separators=(",", ":"), sort_keys=False).encode()
         fh = hashlib.sha256(feat_payload).digest()
         public_fingerprint = hashlib.sha256(model_hash.encode() + fh).digest()
@@ -434,7 +553,6 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
         }
 
 
-
 def ezkl_verify_real(proof_b64: str) -> bool:
     _check_ezkl_ready_or_raise()
 
@@ -443,153 +561,68 @@ def ezkl_verify_real(proof_b64: str) -> bool:
         proof_path = tdir / "proof.json"
         proof_path.write_bytes(base64.b64decode(proof_b64.encode()))
 
-        # Stage the compiled circuit under the default filename; also use it explicitly in flags.
-        compiled_local = _stage_ezkl_defaults_into_dir(tdir)
+        _stage_ezkl_defaults_into_dir(tdir)
 
-        out = _run(
-            [
-                EZKL_BIN,
-                "verify",
-                "--proof-path",
-                str(proof_path),
-                "--vk-path",
-                str(EZKL_VK),
-                "--compiled-circuit",
-                str(compiled_local),
-            ],
-            cwd=tdir,
-        )
+        # Try your current verify first
+        try:
+            out = _run(
+                [
+                    EZKL_BIN,
+                    "verify",
+                    "--proof-path",
+                    str(proof_path),
+                    "--vk-path",
+                    str(EZKL_VK),
+                    "--compiled-circuit",
+                    str(tdir / "model.compiled"),
+                ],
+                cwd=tdir,
+            )
+        except HTTPException:
+            # Fallback: some builds prefer srs-path and/or settings-path and omit compiled-circuit
+            out = _run(
+                [
+                    EZKL_BIN,
+                    "verify",
+                    "--proof-path",
+                    str(proof_path),
+                    "--vk-path",
+                    str(EZKL_VK),
+                    "--srs-path",
+                    str(EZKL_SRS),
+                ],
+                cwd=tdir,
+            )
 
         low = out.lower()
         return ("verified" in low and "true" in low) or ("valid" in low and "true" in low) or ("success" in low)
-
-def _which(cmd: str) -> Optional[str]:
-    from shutil import which
-    return which(cmd)
-
-def _run_no_throw(cmd: List[str]) -> str:
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    return (proc.stdout or "").strip()
-
-def _ezkl_has_gen_witness(ezkl_bin: str) -> bool:
-    out = _run_no_throw([ezkl_bin, "--help"]).lower()
-    # help text varies by version; this is a decent heuristic
-    return "gen-witness" in out or "gen_witness" in out
-
-def _install_ezkl_cli_into_tmp() -> str:
-    """
-    Installs EZKL CLI to /tmp/.ezkl using the official install script,
-    and returns the absolute path to the installed ezkl binary.
-
-    This keeps the fix strictly server-side (app.py only).
-    """
-    install_url = os.getenv(
-        "EZKL_INSTALL_SCRIPT_URL",
-        "https://raw.githubusercontent.com/zkonduit/ezkl/main/install_ezkl_cli.sh",
-    )
-
-    tmp_dir = Path("/tmp/.ezkl_installer")
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    script_path = tmp_dir / "install_ezkl_cli.sh"
-
-    # Download script
-    req = urllib.request.Request(install_url, headers={"User-Agent": "decision-integrity-proof-server/1.0"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        script_path.write_bytes(r.read())
-
-    # Make executable
-    script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC)
-
-    # Run installer (it typically installs into /root/.ezkl or ~/.ezkl depending on env)
-    # We force HOME to /tmp to avoid permission/path weirdness on Render.
-    env = {**os.environ, "HOME": "/tmp"}
-    proc = subprocess.run(
-        ["bash", str(script_path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env=env,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"EZKL install script failed:\n{proc.stdout}")
-
-    # Common install locations
-    candidates = [
-        Path("/tmp/.ezkl/ezkl"),       # if script uses $HOME/.ezkl
-        Path("/tmp/.ezkl/ezkl.exe"),
-        Path("/root/.ezkl/ezkl"),      # sometimes script uses /root/.ezkl even if HOME overridden
-        Path("/root/.ezkl/ezkl.exe"),
-        Path("/tmp/.ezkl/ezkl-linux"), # just in case
-    ]
-    for c in candidates:
-        if c.exists():
-            c.chmod(c.stat().st_mode | stat.S_IEXEC)
-            return str(c)
-
-    # Fallback: look for ezkl on PATH after install
-    found = _which("ezkl")
-    if found:
-        return found
-
-    raise RuntimeError("EZKL install finished but ezkl binary not found in expected locations.")
-
-def _ensure_working_ezkl_cli():
-    """
-    Ensures EZKL_BIN points to a CLI that supports `gen-witness`.
-    If the system ezkl is missing it, install a proper one into /tmp and use that.
-    """
-    global EZKL_BIN
-
-    # If EZKL_BIN is a bare name, try resolve it
-    current = EZKL_BIN
-    if not os.path.isabs(current):
-        resolved = _which(current)
-        if resolved:
-            current = resolved
-
-    # If current binary works, keep it
-    if current and Path(current).exists() and _ezkl_has_gen_witness(current):
-        EZKL_BIN = current
-        print(f"[startup] ezkl ok: {EZKL_BIN} | version: {_run_no_throw([EZKL_BIN, '--version'])}")
-        return
-
-    # Otherwise install
-    print(f"[startup] ezkl missing gen-witness (or not found). Installing EZKL CLI into /tmp ...")
-    installed = _install_ezkl_cli_into_tmp()
-
-    if not _ezkl_has_gen_witness(installed):
-        raise RuntimeError(f"Installed ezkl still missing gen-witness: {installed}")
-
-    EZKL_BIN = installed
-    print(f"[startup] using installed ezkl: {EZKL_BIN} | version: {_run_no_throw([EZKL_BIN, '--version'])}")
 
 
 # =========================
 # Startup checks
 # =========================
-
 @app.on_event("startup")
 def _startup_checks():
     # 0) Ensure we have an EZKL CLI that actually supports gen-witness
     _ensure_working_ezkl_cli()
 
-    # 1) Try downloading pk.key (and optional SRS) BEFORE strict checks
+    # 1) Download pk.key (and optional SRS) BEFORE strict checks
     _maybe_fetch_missing_artifacts()
+
+    # 2) Ensure EZKL default SRS paths exist (Render prove expects /root/.ezkl/srs/kzg15.srs)
+    _ensure_default_srs_files()
 
     if STRICT_EZKL:
         _check_ezkl_ready_or_raise()
 
+    print(f"[startup] artifacts_dir={EZKL_ARTIFACTS_DIR}")
+    print(f"[startup] pk exists={EZKL_PK.exists()} path={EZKL_PK} size={EZKL_PK.stat().st_size if EZKL_PK.exists() else 'NA'}")
+    print(f"[startup] srs exists={EZKL_SRS.exists()} path={EZKL_SRS} size={EZKL_SRS.stat().st_size if EZKL_SRS.exists() else 'NA'}")
 
 
 # =========================
 # Basic endpoints
 # =========================
-
 @app.get("/health")
 def health():
     return {"ok": True, "env": APP_ENV}
@@ -617,7 +650,6 @@ def list_models():
 # =========================
 # Single-phase proof endpoints (REAL ZK)
 # =========================
-
 @app.post("/prove", response_model=ProveResponse)
 def prove(req: ProveRequest):
     model = get_model(req.model_id)
@@ -655,7 +687,6 @@ def verify(req: VerifyRequest):
 # =========================
 # Commitment endpoints
 # =========================
-
 @app.post("/commit", response_model=CommitResponse)
 def commit(req: CommitRequest):
     model = get_model(req.model_id)
@@ -713,7 +744,6 @@ def reveal(req: RevealRequest):
 # =========================
 # Admin demo controls
 # =========================
-
 @app.post("/admin/tamper_proof")
 def admin_tamper_proof(req: "AdminToggleRequest", x_admin_key: Optional[str] = Header(None)):
     require_admin(x_admin_key)
