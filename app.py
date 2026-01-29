@@ -78,14 +78,15 @@ MODELS = [
 EZKL_BIN = os.getenv("EZKL_BIN", "ezkl")
 EZKL_ARTIFACTS_DIR = Path(os.getenv("EZKL_ARTIFACTS_DIR", "./ezkl_artifacts"))
 
-EZKL_MODEL_ONNX = Path(os.getenv("EZKL_MODEL_ONNX", str(EZKL_ARTIFACTS_DIR / "model.onnx")))
-EZKL_SETTINGS = Path(os.getenv("EZKL_SETTINGS", str(EZKL_ARTIFACTS_DIR / "settings.json")))
-EZKL_COMPILED = Path(os.getenv("EZKL_COMPILED", str(EZKL_ARTIFACTS_DIR / "model.ezkl")))
-EZKL_PK = Path(os.getenv("EZKL_PK", str(EZKL_ARTIFACTS_DIR / "pk.key")))
-EZKL_VK = Path(os.getenv("EZKL_VK", str(EZKL_ARTIFACTS_DIR / "vk.key")))
+EZKL_ARTIFACTS_DIR = Path(os.getenv("EZKL_ARTIFACTS_DIR", "./ezkl_artifacts")).resolve()
 
-# Optional SRS (not always needed at verify time, but good to pin for reproducibility)
-EZKL_SRS = Path(os.getenv("EZKL_SRS", str(EZKL_ARTIFACTS_DIR / "kzg17.srs")))
+EZKL_MODEL_ONNX = Path(os.getenv("EZKL_MODEL_ONNX", str(EZKL_ARTIFACTS_DIR / "model.onnx"))).resolve()
+EZKL_SETTINGS   = Path(os.getenv("EZKL_SETTINGS",   str(EZKL_ARTIFACTS_DIR / "settings.json"))).resolve()
+EZKL_COMPILED   = Path(os.getenv("EZKL_COMPILED",   str(EZKL_ARTIFACTS_DIR / "model.ezkl"))).resolve()
+EZKL_PK         = Path(os.getenv("EZKL_PK",         str(EZKL_ARTIFACTS_DIR / "pk.key"))).resolve()
+EZKL_VK         = Path(os.getenv("EZKL_VK",         str(EZKL_ARTIFACTS_DIR / "vk.key"))).resolve()
+EZKL_SRS        = Path(os.getenv("EZKL_SRS",        str(EZKL_ARTIFACTS_DIR / "kzg17.srs"))).resolve()
+
 
 # URLs for missing artifacts (pk is the important one for you)
 EZKL_PK_URL = os.getenv("EZKL_PK_URL", "").strip()
@@ -335,27 +336,22 @@ def _extract_prediction_from_ezkl_witness(witness_json: Dict[str, Any]) -> float
 
 
 def _stage_ezkl_defaults_into_dir(dst_dir: Path) -> Path:
-    """
-    Some EZKL CLI versions expect default artifact filenames in the current working directory.
-    Based on your Render error, gen-witness is looking for: model.compiled
-
-    We stage/copy your repo artifacts into dst_dir using the expected default names:
-      - model.compiled  (from EZKL_COMPILED which is ./ezkl_artifacts/model.ezkl)
-      - settings.json
-      - model.onnx      (safe to include even if not required)
-    Returns the path to the staged compiled circuit.
-    """
-    # settings.json
     (dst_dir / "settings.json").write_bytes(EZKL_SETTINGS.read_bytes())
 
-    # compiled circuit expected as model.compiled
     compiled_local = dst_dir / "model.compiled"
     compiled_local.write_bytes(EZKL_COMPILED.read_bytes())
 
-    # model.onnx (some flows still read this; harmless to stage)
     (dst_dir / "model.onnx").write_bytes(EZKL_MODEL_ONNX.read_bytes())
 
+    if EZKL_PK.exists():
+        (dst_dir / "pk.key").write_bytes(EZKL_PK.read_bytes())
+    if EZKL_VK.exists():
+        (dst_dir / "vk.key").write_bytes(EZKL_VK.read_bytes())
+    if EZKL_SRS.exists():
+        (dst_dir / "kzg17.srs").write_bytes(EZKL_SRS.read_bytes())
+
     return compiled_local
+
 
 
 def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
@@ -363,6 +359,7 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
 
     with tempfile.TemporaryDirectory() as td:
         tdir = Path(td)
+
         input_path = tdir / "input.json"
         witness_path = tdir / "witness.json"
         proof_path = tdir / "proof.json"
@@ -370,44 +367,62 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
         # Stage artifacts in the temp dir under default filenames expected by EZKL CLI on Render
         compiled_local = _stage_ezkl_defaults_into_dir(tdir)
 
-        # Write inputs
+        # Write inputs (EZKL reads input.json from cwd in some builds; we keep it in cwd)
         _write_ezkl_input_json(input_path, features)
 
-        # 1) Witness (Render EZKL expects: ezkl gen-witness --data <DATA>)
-        _run(
-            [
-                EZKL_BIN,
-                "gen-witness",
-                "--data",
-                str(input_path),
-            ],
-            cwd=tdir,
-        )
+        # 1) Witness (Render EZKL expects defaults in cwd; flags vary by build)
+        # Try with --data first, then fallback to bare command if unsupported.
+        try:
+            _run([EZKL_BIN, "gen-witness", "--data", "input.json"], cwd=tdir)
+        except HTTPException:
+            _run([EZKL_BIN, "gen-witness"], cwd=tdir)
 
-        # EZKL writes witness.json in cwd
+        if not witness_path.exists():
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "EZKL witness missing",
+                    "hint": "gen-witness did not produce witness.json in the working directory",
+                },
+            )
+
         witness_obj = json.loads(witness_path.read_text())
         pred = _extract_prediction_from_ezkl_witness(witness_obj)
 
         # 2) Prove
+        # IMPORTANT: use an absolute pk path (or staged pk.key in cwd) so cwd doesn't break it.
+        pk_local = tdir / "pk.key"
+        pk_path = pk_local if pk_local.exists() else EZKL_PK.resolve()
+
+        # Some builds may also want srs in cwd; if staged, it'll be there.
         _run(
             [
                 EZKL_BIN,
                 "prove",
                 "--witness",
-                str(witness_path),
+                "witness.json",
                 "--compiled-circuit",
-                str(compiled_local),
+                "model.compiled",
                 "--pk-path",
-                str(EZKL_PK),
+                str(pk_path),
                 "--proof-path",
-                str(proof_path),
+                "proof.json",
             ],
             cwd=tdir,
         )
 
+        if not proof_path.exists():
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "EZKL proof missing",
+                    "hint": "prove did not produce proof.json in the working directory",
+                },
+            )
+
         proof_bytes = proof_path.read_bytes()
 
-        # Optional "public fingerprint" for your UI
+        # Optional "public fingerprint" for your UI (kept exactly as your current logic)
         feat_payload = json.dumps(features[:4], separators=(",", ":"), sort_keys=False).encode()
         fh = hashlib.sha256(feat_payload).digest()
         public_fingerprint = hashlib.sha256(model_hash.encode() + fh).digest()
@@ -417,6 +432,7 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
             "public_inputs_b64": base64.b64encode(public_fingerprint).decode(),
             "prediction": pred,
         }
+
 
 
 def ezkl_verify_real(proof_b64: str) -> bool:
