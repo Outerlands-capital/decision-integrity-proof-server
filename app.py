@@ -2,31 +2,14 @@
 """
 Decision Integrity Proof Server (Real ZK via EZKL 23.0.3)
 
-This server generates and verifies REAL zk proofs for a deterministic 4->1 sigmoid model
-using EZKL CLI. All heavy artifacts (compile/setup) are done OFFLINE and shipped in.
+Render runs only:
+  gen-witness -> prove -> verify
 
-Runtime (Render) only does: gen-witness -> prove -> verify.
+Offline (Colab) produced and you ship:
+  model.ezkl, vk.key, settings.json, model.onnx, kzg17.srs, pk.key (pk via GitHub Release asset)
 
-Expected runtime artifacts:
-- model.ezkl (compiled circuit)
-- pk.key (proving key)
-- vk.key (verifying key)
-Optional (not required if using compiled circuit flow):
-- model.onnx
-- settings.json
-Optional (nice for reproducibility; not always required at prove-time):
-- kzg17.srs
-
-Env:
-  APP_ENV=dev
-  ADMIN_KEY=...
-  EZKL_BIN=ezkl
-  EZKL_ARTIFACTS_DIR=/app/ezkl_artifacts
-  EZKL_COMPILED=/app/ezkl_artifacts/model.ezkl
-  EZKL_PK=/app/ezkl_artifacts/pk.key
-  EZKL_VK=/app/ezkl_artifacts/vk.key
-  EZKL_SRS=/app/ezkl_artifacts/kzg17.srs
-  STRICT_EZKL=true
+We invoke EZKL as: python -m ezkl
+so we don't depend on a console script named `ezkl` being on PATH.
 """
 
 import base64
@@ -46,7 +29,7 @@ from pydantic import BaseModel, Field
 APP_ENV = os.getenv("APP_ENV", "dev")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "dev-admin-key")
 
-# Demo toggle: when enabled, server will intentionally corrupt proofs to show verification failures
+# Demo toggle: corrupt proofs intentionally to show verify failure.
 TAMPER_PROOF = False
 
 DEFAULT_MODEL_HASH = "sha256:geo-escalation-7d-demo-v1"
@@ -69,22 +52,25 @@ MODELS = [
 # -------------------------
 # EZKL configuration
 # -------------------------
-EZKL_BIN = os.getenv("EZKL_BIN", "ezkl")
-EZKL_ARTIFACTS_DIR = Path(os.getenv("EZKL_ARTIFACTS_DIR", "./ezkl_artifacts"))
+# Use python module invocation to avoid missing PATH entrypoints in Docker.
+EZKL_PY = os.getenv("EZKL_PY", "python")
+EZKL_MODULE_ARGS = os.getenv("EZKL_MODULE_ARGS", "-m ezkl").split()
 
-# Runtime-required artifacts
+EZKL_ARTIFACTS_DIR = Path(os.getenv("EZKL_ARTIFACTS_DIR", "/app/ezkl_artifacts"))
+
+# Runtime-required
 EZKL_COMPILED = Path(os.getenv("EZKL_COMPILED", str(EZKL_ARTIFACTS_DIR / "model.ezkl")))
 EZKL_PK = Path(os.getenv("EZKL_PK", str(EZKL_ARTIFACTS_DIR / "pk.key")))
 EZKL_VK = Path(os.getenv("EZKL_VK", str(EZKL_ARTIFACTS_DIR / "vk.key")))
 
-# Optional artifacts (kept for clarity / future extension)
+# Optional (but usually present in your repo)
 EZKL_MODEL_ONNX = Path(os.getenv("EZKL_MODEL_ONNX", str(EZKL_ARTIFACTS_DIR / "model.onnx")))
 EZKL_SETTINGS = Path(os.getenv("EZKL_SETTINGS", str(EZKL_ARTIFACTS_DIR / "settings.json")))
 EZKL_SRS = Path(os.getenv("EZKL_SRS", str(EZKL_ARTIFACTS_DIR / "kzg17.srs")))
 
 STRICT_EZKL = os.getenv("STRICT_EZKL", "true").lower() in ("1", "true", "yes")
 
-app = FastAPI(title="Decision Integrity Proof Server", version="0.4.1-real-zk-ezkl-23.0.3")
+app = FastAPI(title="Decision Integrity Proof Server", version="0.4.2-real-zk-ezkl-23.0.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -232,24 +218,31 @@ def _run(cmd: List[str], cwd: Optional[Path] = None) -> str:
             text=True,
         )
         return proc.stdout
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "EZKL binary not found",
-                "hint": "Ensure ezkl is installed in the container and EZKL_BIN is correct.",
-                "EZKL_BIN": EZKL_BIN,
-            },
-        )
     except subprocess.CalledProcessError as e:
         raise HTTPException(
             status_code=500,
             detail={
-                "error": "EZKL command failed",
+                "error": "Command failed",
                 "cmd": cmd,
                 "output": e.stdout,
             },
         )
+
+
+def _run_ezkl(args: List[str], cwd: Optional[Path] = None) -> str:
+    # Runs: python -m ezkl <args...>
+    cmd = [EZKL_PY] + EZKL_MODULE_ARGS + args
+    return _run(cmd, cwd=cwd)
+
+
+def _artifact_info(p: Path) -> Dict[str, Any]:
+    if not p.exists():
+        return {"exists": False, "path": str(p)}
+    try:
+        size = p.stat().st_size
+    except Exception:
+        size = None
+    return {"exists": True, "size_bytes": size, "path": str(p)}
 
 
 def _check_ezkl_ready_or_raise():
@@ -257,32 +250,25 @@ def _check_ezkl_ready_or_raise():
     for p in [EZKL_COMPILED, EZKL_PK, EZKL_VK]:
         if not p.exists():
             missing.append(str(p))
-
     if missing:
         raise HTTPException(
             status_code=500,
             detail={
                 "error": "EZKL artifacts missing (runtime-required).",
                 "missing": missing,
-                "hint": (
-                    "Runtime requires: model.ezkl, pk.key, vk.key. "
-                    "Verify your Dockerfile copies/downloads these into EZKL_ARTIFACTS_DIR."
-                ),
+                "hint": "Runtime requires: model.ezkl, pk.key, vk.key in /app/ezkl_artifacts.",
             },
         )
 
 
 def _write_ezkl_input_json(path: Path, features: List[float]):
-    """
-    Matches the common EZKL input schema used in your Colab:
-      {"input_data": [[f1,f2,f3,f4]]}
-    """
+    # Matches your Colab format:
+    # {"input_data": [[f1,f2,f3,f4]]}
     data = {"input_data": [features[:4]]}
     path.write_text(json.dumps(data, separators=(",", ":")))
 
 
 def _find_first_scalar(x: Any) -> Optional[float]:
-    # Walk nested lists/dicts to find the first numeric scalar.
     if isinstance(x, (int, float)):
         return float(x)
     if isinstance(x, list) and x:
@@ -291,13 +277,11 @@ def _find_first_scalar(x: Any) -> Optional[float]:
             if v is not None:
                 return v
     if isinstance(x, dict):
-        # common keys to prefer
         for k in ("outputs", "output_data", "output", "out", "result"):
             if k in x:
                 v = _find_first_scalar(x[k])
                 if v is not None:
                     return v
-        # otherwise scan values
         for v0 in x.values():
             v = _find_first_scalar(v0)
             if v is not None:
@@ -306,22 +290,17 @@ def _find_first_scalar(x: Any) -> Optional[float]:
 
 
 def _extract_prediction_from_witness_file(witness_path: Path) -> float:
-    """
-    EZKL witness.json formats vary. We try to parse and locate the first scalar output.
-    If not found, returns NaN.
-    """
     try:
         obj = json.loads(witness_path.read_text())
     except Exception:
         return float("nan")
-
     v = _find_first_scalar(obj)
     return float(v) if v is not None else float("nan")
 
 
 def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
     """
-    EZKL 23.0.3-compatible flow:
+    EZKL 23.0.3 flow (compiled circuit):
       gen-witness --data input.json --compiled-circuit model.ezkl --output witness.json
       prove       --witness witness.json --compiled-circuit model.ezkl --pk-path pk.key --proof-path proof.json
     """
@@ -335,10 +314,8 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
 
         _write_ezkl_input_json(input_path, features)
 
-        # 1) Generate witness (runs inference inside the compiled circuit)
-        _run(
+        _run_ezkl(
             [
-                EZKL_BIN,
                 "gen-witness",
                 "--data",
                 str(input_path),
@@ -352,10 +329,8 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
 
         pred = _extract_prediction_from_witness_file(witness_path)
 
-        # 2) Prove
-        _run(
+        _run_ezkl(
             [
-                EZKL_BIN,
                 "prove",
                 "--witness",
                 str(witness_path),
@@ -399,9 +374,8 @@ def ezkl_verify_real(proof_b64: str) -> Dict[str, Any]:
         except Exception as e:
             return {"valid": False, "detail": {"error": "Invalid base64 proof", "exception": str(e)}}
 
-        out = _run(
+        out = _run_ezkl(
             [
-                EZKL_BIN,
                 "verify",
                 "--proof-path",
                 str(proof_path),
@@ -418,16 +392,6 @@ def ezkl_verify_real(proof_b64: str) -> Dict[str, Any]:
         return {"valid": bool(valid), "detail": {"output": out}}
 
 
-def _artifact_info(p: Path) -> Dict[str, Any]:
-    if not p.exists():
-        return {"exists": False}
-    try:
-        size = p.stat().st_size
-    except Exception:
-        size = None
-    return {"exists": True, "size_bytes": size, "path": str(p)}
-
-
 # =========================
 # Startup checks
 # =========================
@@ -436,8 +400,8 @@ def _artifact_info(p: Path) -> Dict[str, Any]:
 def _startup_checks():
     if STRICT_EZKL:
         _check_ezkl_ready_or_raise()
-        # also confirm ezkl runs
-        _ = _run([EZKL_BIN, "--version"])
+        # Ensure EZKL runs
+        _ = _run_ezkl(["--version"])
 
 
 # =========================
@@ -448,7 +412,7 @@ def _startup_checks():
 def health():
     ezkl_version = None
     try:
-        ezkl_version = _run([EZKL_BIN, "--version"]).strip()
+        ezkl_version = _run_ezkl(["--version"]).strip()
     except Exception:
         ezkl_version = None
 
@@ -469,7 +433,7 @@ def health():
 
 @app.get("/version")
 def version():
-    return {"version": "0.4.1-real-zk-ezkl-23.0.3"}
+    return {"version": "0.4.2-real-zk-ezkl-23.0.3"}
 
 
 @app.get("/models")
@@ -487,7 +451,7 @@ def list_models():
 
 
 # =========================
-# Single-phase proof endpoints (REAL ZK)
+# Single-phase proof endpoints
 # =========================
 
 @app.post("/prove", response_model=ProveResponse)
@@ -499,8 +463,7 @@ def prove(req: ProveRequest):
 
     pred = zk.get("prediction", float("nan"))
     if isinstance(pred, (int, float)) and (math.isnan(pred) or math.isinf(pred)):
-        # Keep demo alive, but deterministic fallback
-        pred = 0.0
+        pred = 0.0  # deterministic fallback for demo
 
     proof_b64 = zk["proof_b64"]
     if TAMPER_PROOF:
@@ -517,8 +480,7 @@ def prove(req: ProveRequest):
 
 @app.post("/verify", response_model=VerifyResponse)
 def verify(req: VerifyRequest):
-    _ = get_model(req.model_id)  # registry/UX parity
-
+    _ = get_model(req.model_id)
     res = ezkl_verify_real(req.proof_b64)
     return VerifyResponse(model_id=req.model_id, valid=bool(res["valid"]), detail=res.get("detail"))
 
@@ -541,7 +503,7 @@ def commit(req: CommitRequest):
 
 
 # =========================
-# Two-phase audit endpoints (REAL ZK on reveal)
+# Two-phase audit endpoints
 # =========================
 
 @app.post("/commit_case", response_model=CommitCaseResponse)
