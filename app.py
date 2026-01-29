@@ -36,6 +36,9 @@ import math
 import os
 import subprocess
 import tempfile
+import stat
+import platform
+
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -444,6 +447,111 @@ def ezkl_verify_real(proof_b64: str) -> bool:
         low = out.lower()
         return ("verified" in low and "true" in low) or ("valid" in low and "true" in low) or ("success" in low)
 
+def _which(cmd: str) -> Optional[str]:
+    from shutil import which
+    return which(cmd)
+
+def _run_no_throw(cmd: List[str]) -> str:
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return (proc.stdout or "").strip()
+
+def _ezkl_has_gen_witness(ezkl_bin: str) -> bool:
+    out = _run_no_throw([ezkl_bin, "--help"]).lower()
+    # help text varies by version; this is a decent heuristic
+    return "gen-witness" in out or "gen_witness" in out
+
+def _install_ezkl_cli_into_tmp() -> str:
+    """
+    Installs EZKL CLI to /tmp/.ezkl using the official install script,
+    and returns the absolute path to the installed ezkl binary.
+
+    This keeps the fix strictly server-side (app.py only).
+    """
+    install_url = os.getenv(
+        "EZKL_INSTALL_SCRIPT_URL",
+        "https://raw.githubusercontent.com/zkonduit/ezkl/main/install_ezkl_cli.sh",
+    )
+
+    tmp_dir = Path("/tmp/.ezkl_installer")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    script_path = tmp_dir / "install_ezkl_cli.sh"
+
+    # Download script
+    req = urllib.request.Request(install_url, headers={"User-Agent": "decision-integrity-proof-server/1.0"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        script_path.write_bytes(r.read())
+
+    # Make executable
+    script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC)
+
+    # Run installer (it typically installs into /root/.ezkl or ~/.ezkl depending on env)
+    # We force HOME to /tmp to avoid permission/path weirdness on Render.
+    env = {**os.environ, "HOME": "/tmp"}
+    proc = subprocess.run(
+        ["bash", str(script_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"EZKL install script failed:\n{proc.stdout}")
+
+    # Common install locations
+    candidates = [
+        Path("/tmp/.ezkl/ezkl"),       # if script uses $HOME/.ezkl
+        Path("/tmp/.ezkl/ezkl.exe"),
+        Path("/root/.ezkl/ezkl"),      # sometimes script uses /root/.ezkl even if HOME overridden
+        Path("/root/.ezkl/ezkl.exe"),
+        Path("/tmp/.ezkl/ezkl-linux"), # just in case
+    ]
+    for c in candidates:
+        if c.exists():
+            c.chmod(c.stat().st_mode | stat.S_IEXEC)
+            return str(c)
+
+    # Fallback: look for ezkl on PATH after install
+    found = _which("ezkl")
+    if found:
+        return found
+
+    raise RuntimeError("EZKL install finished but ezkl binary not found in expected locations.")
+
+def _ensure_working_ezkl_cli():
+    """
+    Ensures EZKL_BIN points to a CLI that supports `gen-witness`.
+    If the system ezkl is missing it, install a proper one into /tmp and use that.
+    """
+    global EZKL_BIN
+
+    # If EZKL_BIN is a bare name, try resolve it
+    current = EZKL_BIN
+    if not os.path.isabs(current):
+        resolved = _which(current)
+        if resolved:
+            current = resolved
+
+    # If current binary works, keep it
+    if current and Path(current).exists() and _ezkl_has_gen_witness(current):
+        EZKL_BIN = current
+        print(f"[startup] ezkl ok: {EZKL_BIN} | version: {_run_no_throw([EZKL_BIN, '--version'])}")
+        return
+
+    # Otherwise install
+    print(f"[startup] ezkl missing gen-witness (or not found). Installing EZKL CLI into /tmp ...")
+    installed = _install_ezkl_cli_into_tmp()
+
+    if not _ezkl_has_gen_witness(installed):
+        raise RuntimeError(f"Installed ezkl still missing gen-witness: {installed}")
+
+    EZKL_BIN = installed
+    print(f"[startup] using installed ezkl: {EZKL_BIN} | version: {_run_no_throw([EZKL_BIN, '--version'])}")
+
 
 # =========================
 # Startup checks
@@ -451,11 +559,15 @@ def ezkl_verify_real(proof_b64: str) -> bool:
 
 @app.on_event("startup")
 def _startup_checks():
-    # Try downloading pk.key (and optional SRS) BEFORE strict checks
+    # 0) Ensure we have an EZKL CLI that actually supports gen-witness
+    _ensure_working_ezkl_cli()
+
+    # 1) Try downloading pk.key (and optional SRS) BEFORE strict checks
     _maybe_fetch_missing_artifacts()
 
     if STRICT_EZKL:
         _check_ezkl_ready_or_raise()
+
 
 
 # =========================
