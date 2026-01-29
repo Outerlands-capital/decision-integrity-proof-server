@@ -33,6 +33,11 @@ Option 2 (server-side only, no API changes):
 - Store commit records in-memory keyed by commitment_hash.
 - On /reveal, enforce that the CURRENT model hash equals the model hash at commit time.
   If model hash was rotated after commit -> commitment_matches becomes false.
+
+FIXES:
+- Make verify deterministic on Render by using staged default filenames in the temp working dir
+  (vk.key + model.compiled + settings.json + srs staged into cwd), and using relative paths.
+- Log verify failures to Render logs without changing API schemas.
 """
 
 import base64
@@ -487,7 +492,7 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
         witness_path = tdir / "witness.json"
         proof_path = tdir / "proof.json"
 
-        compiled_local = _stage_ezkl_defaults_into_dir(tdir)
+        _stage_ezkl_defaults_into_dir(tdir)
 
         _write_ezkl_input_json(input_path, features)
 
@@ -552,6 +557,12 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
 
 
 def ezkl_verify_real(proof_b64: str) -> bool:
+    """
+    IMPORTANT:
+    Render's EZKL builds can be sensitive to filenames + cwd.
+    We stage vk.key + model.compiled (+ settings/model/srs) into a temp cwd and
+    run verify using RELATIVE paths in that cwd to avoid brittle path resolution.
+    """
     _check_ezkl_ready_or_raise()
 
     with tempfile.TemporaryDirectory() as td:
@@ -559,7 +570,7 @@ def ezkl_verify_real(proof_b64: str) -> bool:
         proof_path = tdir / "proof.json"
         proof_path.write_bytes(base64.b64decode(proof_b64.encode()))
 
-        compiled_local = _stage_ezkl_defaults_into_dir(tdir)
+        _stage_ezkl_defaults_into_dir(tdir)
 
         # If ezkl verify exits 0, it's valid. If not, _run throws.
         _run(
@@ -567,16 +578,15 @@ def ezkl_verify_real(proof_b64: str) -> bool:
                 EZKL_BIN,
                 "verify",
                 "--proof-path",
-                str(proof_path),
+                "proof.json",
                 "--vk-path",
-                str(EZKL_VK),
+                "vk.key",
                 "--compiled-circuit",
-                str(compiled_local),
+                "model.compiled",
             ],
             cwd=tdir,
         )
         return True
-
 
 
 # =========================
@@ -650,7 +660,15 @@ def verify(req: VerifyRequest):
     try:
         valid = ezkl_verify_real(req.proof_b64)
         return VerifyResponse(model_id=req.model_id, valid=bool(valid))
-    except Exception:
+    except HTTPException as e:
+        # Log detailed EZKL failure info to Render logs, without changing API output
+        try:
+            print("[verify] EZKL failure detail:", json.dumps(e.detail, ensure_ascii=False))
+        except Exception:
+            print("[verify] EZKL failure detail (raw):", repr(e.detail))
+        return VerifyResponse(model_id=req.model_id, valid=False)
+    except Exception as e:
+        print("[verify] unexpected exception:", repr(e))
         return VerifyResponse(model_id=req.model_id, valid=False)
 
 
@@ -705,11 +723,6 @@ def reveal(req: RevealRequest):
     computed_now = compute_commitment(model["model_hash"], fh, req.nonce, req.context or {})
 
     # Option 2 enforcement:
-    # If we have a commit record for expected_commitment_hash, require:
-    # - same model hash as at commit time
-    # - same features hash
-    # - same nonce
-    # - same context hash
     _prune_commit_db()
     with COMMIT_DB_LOCK:
         record = COMMIT_DB.get(req.expected_commitment_hash)
@@ -723,8 +736,6 @@ def reveal(req: RevealRequest):
         context_ok = (record.get("context_hash") == context_hash)
 
         matches = bool(model_hash_ok and features_ok and nonce_ok and context_ok)
-
-        # Return the original expected commitment hash so UI stays anchored to the commit
         commitment_to_return = req.expected_commitment_hash
     else:
         # Fallback behavior (e.g., server restarted and lost COMMIT_DB)
