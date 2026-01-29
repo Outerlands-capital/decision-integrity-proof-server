@@ -5,11 +5,11 @@ Decision Integrity Proof Server (Real ZK via EZKL 23.0.3)
 Render runs only:
   gen-witness -> prove -> verify
 
-Offline (Colab) produced and you ship:
-  model.ezkl, vk.key, settings.json, model.onnx, kzg17.srs, pk.key (pk via GitHub Release asset)
+Offline (Colab) produced:
+  model.ezkl, settings.json, model.onnx, vk.key, kzg17.srs, pk.key
 
-We invoke EZKL as: python -m ezkl
-so we don't depend on a console script named `ezkl` being on PATH.
+We invoke EZKL via CLI: ezkl <cmd>
+Dockerfile installs ezkl into /usr/local/bin/ezkl.
 """
 
 import base64
@@ -52,9 +52,7 @@ MODELS = [
 # -------------------------
 # EZKL configuration
 # -------------------------
-# Use python module invocation to avoid missing PATH entrypoints in Docker.
-EZKL_PY = os.getenv("EZKL_PY", "python")
-EZKL_MODULE_ARGS = os.getenv("EZKL_MODULE_ARGS", "-m ezkl").split()
+EZKL_BIN = os.getenv("EZKL_BIN", "ezkl")
 
 EZKL_ARTIFACTS_DIR = Path(os.getenv("EZKL_ARTIFACTS_DIR", "/app/ezkl_artifacts"))
 
@@ -63,14 +61,14 @@ EZKL_COMPILED = Path(os.getenv("EZKL_COMPILED", str(EZKL_ARTIFACTS_DIR / "model.
 EZKL_PK = Path(os.getenv("EZKL_PK", str(EZKL_ARTIFACTS_DIR / "pk.key")))
 EZKL_VK = Path(os.getenv("EZKL_VK", str(EZKL_ARTIFACTS_DIR / "vk.key")))
 
-# Optional (but usually present in your repo)
+# Optional (but typically present in your repo)
 EZKL_MODEL_ONNX = Path(os.getenv("EZKL_MODEL_ONNX", str(EZKL_ARTIFACTS_DIR / "model.onnx")))
 EZKL_SETTINGS = Path(os.getenv("EZKL_SETTINGS", str(EZKL_ARTIFACTS_DIR / "settings.json")))
 EZKL_SRS = Path(os.getenv("EZKL_SRS", str(EZKL_ARTIFACTS_DIR / "kzg17.srs")))
 
 STRICT_EZKL = os.getenv("STRICT_EZKL", "true").lower() in ("1", "true", "yes")
 
-app = FastAPI(title="Decision Integrity Proof Server", version="0.4.2-real-zk-ezkl-23.0.3")
+app = FastAPI(title="Decision Integrity Proof Server", version="0.4.3-real-zk-ezkl-23.0.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -218,6 +216,15 @@ def _run(cmd: List[str], cwd: Optional[Path] = None) -> str:
             text=True,
         )
         return proc.stdout
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Command not found",
+                "cmd": cmd,
+                "hint": "Check that ezkl is installed in the container and EZKL_BIN is correct.",
+            },
+        )
     except subprocess.CalledProcessError as e:
         raise HTTPException(
             status_code=500,
@@ -230,9 +237,7 @@ def _run(cmd: List[str], cwd: Optional[Path] = None) -> str:
 
 
 def _run_ezkl(args: List[str], cwd: Optional[Path] = None) -> str:
-    # Runs: python -m ezkl <args...>
-    cmd = [EZKL_PY] + EZKL_MODULE_ARGS + args
-    return _run(cmd, cwd=cwd)
+    return _run([EZKL_BIN] + args, cwd=cwd)
 
 
 def _artifact_info(p: Path) -> Dict[str, Any]:
@@ -400,7 +405,6 @@ def ezkl_verify_real(proof_b64: str) -> Dict[str, Any]:
 def _startup_checks():
     if STRICT_EZKL:
         _check_ezkl_ready_or_raise()
-        # Ensure EZKL runs
         _ = _run_ezkl(["--version"])
 
 
@@ -433,7 +437,7 @@ def health():
 
 @app.get("/version")
 def version():
-    return {"version": "0.4.2-real-zk-ezkl-23.0.3"}
+    return {"version": "0.4.3-real-zk-ezkl-23.0.3"}
 
 
 @app.get("/models")
