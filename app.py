@@ -1,16 +1,11 @@
 # app.py
 """
-Decision Integrity Proof Server (Real ZK via EZKL)
+Decision Integrity Proof Server (Real ZK via EZKL CLI)
 
-Offline artifacts (Colab):
-  model.ezkl, vk.key, settings.json, model.onnx, kzg17.srs, pk.key (pk is large)
-
-Render runtime:
-  ezkl gen-witness -> ezkl prove -> ezkl verify
-
-Notes:
-- This is a demo, not production hardening.
-- We invoke the EZKL CLI as a subprocess.
+Key points:
+- We install the EZKL CLI (ezkl) and shell out to it for gen-witness / prove / verify.
+- Artifacts are generated OFFLINE and served from disk (or downloaded from GitHub Releases).
+- This is a demo (not production hardening).
 """
 
 import base64
@@ -18,6 +13,8 @@ import hashlib
 import json
 import math
 import os
+import shutil
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -30,7 +27,7 @@ from pydantic import BaseModel, Field
 APP_ENV = os.getenv("APP_ENV", "dev")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "dev-admin-key")
 
-# Demo toggle: corrupt proofs intentionally to show verification failure
+# Demo toggle: intentionally corrupt proof transport to show verification failures
 TAMPER_PROOF = False
 
 DEFAULT_MODEL_HASH = "sha256:geo-escalation-7d-demo-v1"
@@ -54,18 +51,27 @@ MODELS = [
 # EZKL configuration
 # -------------------------
 EZKL_BIN = os.getenv("EZKL_BIN", "ezkl")
-EZKL_ARTIFACTS_DIR = Path(os.getenv("EZKL_ARTIFACTS_DIR", "/app/ezkl_artifacts"))
 
+EZKL_ARTIFACTS_DIR = Path(os.getenv("EZKL_ARTIFACTS_DIR", "./ezkl_artifacts"))
 EZKL_MODEL_ONNX = Path(os.getenv("EZKL_MODEL_ONNX", str(EZKL_ARTIFACTS_DIR / "model.onnx")))
 EZKL_SETTINGS = Path(os.getenv("EZKL_SETTINGS", str(EZKL_ARTIFACTS_DIR / "settings.json")))
 EZKL_COMPILED = Path(os.getenv("EZKL_COMPILED", str(EZKL_ARTIFACTS_DIR / "model.ezkl")))
 EZKL_PK = Path(os.getenv("EZKL_PK", str(EZKL_ARTIFACTS_DIR / "pk.key")))
 EZKL_VK = Path(os.getenv("EZKL_VK", str(EZKL_ARTIFACTS_DIR / "vk.key")))
+# You generated kzg17.srs in Colab; keep that name.
 EZKL_SRS = Path(os.getenv("EZKL_SRS", str(EZKL_ARTIFACTS_DIR / "kzg17.srs")))
+
+# Optional: download artifacts at runtime if missing
+EZKL_MODEL_ONNX_URL = os.getenv("EZKL_MODEL_ONNX_URL", "")
+EZKL_SETTINGS_URL = os.getenv("EZKL_SETTINGS_URL", "")
+EZKL_COMPILED_URL = os.getenv("EZKL_COMPILED_URL", "")
+EZKL_PK_URL = os.getenv("EZKL_PK_URL", "")
+EZKL_VK_URL = os.getenv("EZKL_VK_URL", "")
+EZKL_SRS_URL = os.getenv("EZKL_SRS_URL", "")
 
 STRICT_EZKL = os.getenv("STRICT_EZKL", "true").lower() in ("1", "true", "yes")
 
-app = FastAPI(title="Decision Integrity Proof Server", version="0.4.4-real-zk-ezkl-23.0.3")
+app = FastAPI(title="Decision Integrity Proof Server", version="0.4.1-real-zk-ezkl")
 
 app.add_middleware(
     CORSMiddleware,
@@ -75,14 +81,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # =========================
 # Request/Response Models
 # =========================
 
 class ProveRequest(BaseModel):
     model_id: str = Field(..., description="Which approved model version to use")
-    features: List[float] = Field(..., description="Numeric feature vector")
+    features: List[float] = Field(..., description="Numeric feature vector (first 4 used)")
     context: Optional[Dict[str, Any]] = Field(default=None)
 
 
@@ -103,7 +108,6 @@ class VerifyRequest(BaseModel):
 class VerifyResponse(BaseModel):
     model_id: str
     valid: bool
-    detail: Optional[Any] = None
 
 
 class CommitRequest(BaseModel):
@@ -155,7 +159,6 @@ class AdminToggleRequest(BaseModel):
 class AdminSetModelHashRequest(BaseModel):
     model_id: str
     model_hash: str
-
 
 # =========================
 # Helpers
@@ -213,98 +216,137 @@ def _run(cmd: List[str], cwd: Optional[Path] = None) -> str:
             text=True,
         )
         return proc.stdout
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "Command not found",
-                "cmd": cmd,
-                "hint": "EZKL binary missing. In Dockerfile we install it to /usr/local/bin/ezkl.",
-            },
-        )
     except subprocess.CalledProcessError as e:
         raise HTTPException(
             status_code=500,
+            detail={"error": "EZKL command failed", "cmd": cmd, "output": e.stdout},
+        )
+
+
+def _curl_download(url: str, dst: Path):
+    if not url:
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    # Use curl via subprocess to avoid adding python requests dependency.
+    _run(["curl", "-fL", url, "-o", str(dst)])
+
+
+def _ensure_artifacts_present():
+    """
+    If artifacts are missing but *_URL env vars are provided, download them.
+    This makes Render deploys easier (you can store big pk.key in GitHub Releases).
+    """
+    EZKL_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    mapping = [
+        (EZKL_MODEL_ONNX, EZKL_MODEL_ONNX_URL),
+        (EZKL_SETTINGS, EZKL_SETTINGS_URL),
+        (EZKL_COMPILED, EZKL_COMPILED_URL),
+        (EZKL_PK, EZKL_PK_URL),
+        (EZKL_VK, EZKL_VK_URL),
+        (EZKL_SRS, EZKL_SRS_URL),
+    ]
+
+    for path, url in mapping:
+        if not path.exists() and url:
+            _curl_download(url, path)
+
+
+def _ensure_ezkl_binary():
+    """
+    Ensure EZKL_BIN is executable and exists in PATH or as an absolute path.
+    """
+    # If EZKL_BIN is a path, check it
+    if "/" in EZKL_BIN:
+        p = Path(EZKL_BIN)
+        if not p.exists():
+            raise HTTPException(status_code=500, detail={"error": "EZKL binary not found", "path": str(p)})
+        st = p.stat()
+        if not (st.st_mode & stat.S_IXUSR):
+            p.chmod(st.st_mode | stat.S_IXUSR)
+        return
+
+    # Otherwise rely on PATH
+    try:
+        _run([EZKL_BIN, "--version"])
+    except HTTPException:
+        raise HTTPException(
+            status_code=500,
             detail={
-                "error": "Command failed",
-                "cmd": cmd,
-                "output": e.stdout,
+                "error": "EZKL CLI not found on PATH",
+                "hint": "Set EZKL_BIN to an absolute path like /usr/local/bin/ezkl",
             },
         )
 
 
-def _run_ezkl(args: List[str], cwd: Optional[Path] = None) -> str:
-    return _run([EZKL_BIN] + args, cwd=cwd)
+def _ensure_srs_in_default_location():
+    """
+    In your Colab run (ezkl 23.0.3), EZKL expects kzg17.srs (and sometimes kzg15.srs)
+    under ~/.ezkl/ . We copy your pinned SRS there if present.
+    """
+    if not EZKL_SRS.exists():
+        return
 
+    home = Path(os.getenv("HOME", "/root"))
+    default_dir = home / ".ezkl"
+    default_dir.mkdir(parents=True, exist_ok=True)
 
-def _artifact_info(p: Path) -> Dict[str, Any]:
-    if not p.exists():
-        return {"exists": False, "path": str(p)}
-    try:
-        size = p.stat().st_size
-    except Exception:
-        size = None
-    return {"exists": True, "size_bytes": size, "path": str(p)}
+    # Copy to the expected filenames
+    dst17 = default_dir / "kzg17.srs"
+    if not dst17.exists():
+        shutil.copy2(EZKL_SRS, dst17)
+
+    # Some flows look for kzg15.srs too; copy same file (good enough for this demo)
+    dst15 = default_dir / "kzg15.srs"
+    if not dst15.exists():
+        shutil.copy2(EZKL_SRS, dst15)
 
 
 def _check_ezkl_ready_or_raise():
     missing = []
-    for p in [EZKL_COMPILED, EZKL_PK, EZKL_VK]:
+    for p in [EZKL_MODEL_ONNX, EZKL_SETTINGS, EZKL_COMPILED, EZKL_PK, EZKL_VK]:
         if not p.exists():
             missing.append(str(p))
+
     if missing:
         raise HTTPException(
             status_code=500,
             detail={
-                "error": "EZKL artifacts missing (runtime-required).",
+                "error": "EZKL artifacts missing",
                 "missing": missing,
-                "hint": "Need: model.ezkl, pk.key, vk.key under /app/ezkl_artifacts (or override EZKL_* env vars).",
+                "hint": (
+                    "Provide artifacts on disk OR set EZKL_*_URL env vars so the server downloads them. "
+                    "Required: model.onnx, settings.json, model.ezkl, pk.key, vk.key. "
+                    "Recommended: kzg17.srs (set EZKL_SRS_URL)."
+                ),
             },
         )
 
 
 def _write_ezkl_input_json(path: Path, features: List[float]):
-    # Colab format: {"input_data": [[f1,f2,f3,f4]]}
+    # Your ONNX expects [1,4]
     data = {"input_data": [features[:4]]}
-    path.write_text(json.dumps(data, separators=(",", ":")))
+    path.write_text(json.dumps(data))
 
 
-def _find_first_scalar(x: Any) -> Optional[float]:
-    if isinstance(x, (int, float)):
-        return float(x)
-    if isinstance(x, list) and x:
-        for item in x:
-            v = _find_first_scalar(item)
-            if v is not None:
-                return v
-    if isinstance(x, dict):
-        for k in ("outputs", "output_data", "output", "out", "result"):
-            if k in x:
-                v = _find_first_scalar(x[k])
-                if v is not None:
-                    return v
-        for v0 in x.values():
-            v = _find_first_scalar(v0)
-            if v is not None:
-                return v
-    return None
-
-
-def _extract_prediction_from_witness_file(witness_path: Path) -> float:
-    try:
-        obj = json.loads(witness_path.read_text())
-    except Exception:
-        return float("nan")
-    v = _find_first_scalar(obj)
-    return float(v) if v is not None else float("nan")
+def _extract_prediction_from_ezkl_witness(witness_json: Dict[str, Any]) -> float:
+    """
+    Best-effort extraction; different ezkl versions may structure witness differently.
+    """
+    for key in ("outputs", "output_data", "output"):
+        if key in witness_json:
+            out = witness_json[key]
+            try:
+                if isinstance(out, list) and len(out) > 0:
+                    if isinstance(out[0], list) and len(out[0]) > 0:
+                        return float(out[0][0])
+                    return float(out[0])
+            except Exception:
+                pass
+    return float("nan")
 
 
 def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
-    """
-    EZKL 23.0.3 flow (compiled circuit):
-      gen-witness --data input.json --compiled-circuit model.ezkl --output witness.json
-      prove       --witness witness.json --compiled-circuit model.ezkl --pk-path pk.key --proof-path proof.json
-    """
     _check_ezkl_ready_or_raise()
 
     with tempfile.TemporaryDirectory() as td:
@@ -315,23 +357,28 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
 
         _write_ezkl_input_json(input_path, features)
 
-        _run_ezkl(
+        # 1) gen-witness (runs inference)
+        _run(
             [
+                EZKL_BIN,
                 "gen-witness",
                 "--data",
                 str(input_path),
-                "--compiled-circuit",
-                str(EZKL_COMPILED),
+                "--model",
+                str(EZKL_MODEL_ONNX),
                 "--output",
                 str(witness_path),
             ],
             cwd=tdir,
         )
 
-        pred = _extract_prediction_from_witness_file(witness_path)
+        witness_obj = json.loads(witness_path.read_text())
+        pred = _extract_prediction_from_ezkl_witness(witness_obj)
 
-        _run_ezkl(
+        # 2) prove
+        _run(
             [
+                EZKL_BIN,
                 "prove",
                 "--witness",
                 str(witness_path),
@@ -347,7 +394,7 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
 
         proof_bytes = proof_path.read_bytes()
 
-        # Stable UI fingerprint (not required by EZKL verify)
+        # UI/audit fingerprint (not required by EZKL verify)
         feat_payload = json.dumps(features[:4], separators=(",", ":"), sort_keys=False).encode()
         fh = hashlib.sha256(feat_payload).digest()
         public_fingerprint = hashlib.sha256(model_hash.encode() + fh).digest()
@@ -359,23 +406,17 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
         }
 
 
-def ezkl_verify_real(proof_b64: str) -> Dict[str, Any]:
-    """
-    verify --proof-path proof.json --vk-path vk.key --compiled-circuit model.ezkl
-    """
+def ezkl_verify_real(proof_b64: str) -> bool:
     _check_ezkl_ready_or_raise()
 
     with tempfile.TemporaryDirectory() as td:
         tdir = Path(td)
         proof_path = tdir / "proof.json"
+        proof_path.write_bytes(base64.b64decode(proof_b64.encode()))
 
-        try:
-            proof_path.write_bytes(base64.b64decode(proof_b64.encode()))
-        except Exception as e:
-            return {"valid": False, "detail": {"error": "Invalid base64 proof", "exception": str(e)}}
-
-        out = _run_ezkl(
+        out = _run(
             [
+                EZKL_BIN,
                 "verify",
                 "--proof-path",
                 str(proof_path),
@@ -388,9 +429,7 @@ def ezkl_verify_real(proof_b64: str) -> Dict[str, Any]:
         )
 
         low = out.lower()
-        valid = ("verified" in low and "true" in low) or ("valid" in low and "true" in low) or ("success" in low)
-        return {"valid": bool(valid), "detail": {"output": out}}
-
+        return ("verified" in low and "true" in low) or ("valid" in low and "true" in low) or ("success" in low)
 
 # =========================
 # Startup checks
@@ -398,10 +437,12 @@ def ezkl_verify_real(proof_b64: str) -> Dict[str, Any]:
 
 @app.on_event("startup")
 def _startup_checks():
+    _ensure_ezkl_binary()
+    _ensure_artifacts_present()
+    _ensure_srs_in_default_location()
+
     if STRICT_EZKL:
         _check_ezkl_ready_or_raise()
-        _ = _run_ezkl(["--version"])
-
 
 # =========================
 # Basic endpoints
@@ -409,31 +450,16 @@ def _startup_checks():
 
 @app.get("/health")
 def health():
-    ezkl_version = None
-    try:
-        ezkl_version = _run_ezkl(["--version"]).strip()
-    except Exception:
-        ezkl_version = None
-
-    return {
-        "ok": True,
-        "env": APP_ENV,
-        "ezkl_version": ezkl_version,
-        "artifacts": {
-            "compiled": _artifact_info(EZKL_COMPILED),
-            "pk": _artifact_info(EZKL_PK),
-            "vk": _artifact_info(EZKL_VK),
-            "srs": _artifact_info(EZKL_SRS),
-            "onnx": _artifact_info(EZKL_MODEL_ONNX),
-            "settings": _artifact_info(EZKL_SETTINGS),
-        },
-    }
-
+    return {"ok": True, "env": APP_ENV}
 
 @app.get("/version")
 def version():
-    return {"version": "0.4.4-real-zk-ezkl-23.0.3"}
-
+    # also show ezkl version for debugging
+    try:
+        v = _run([EZKL_BIN, "--version"]).strip()
+    except Exception:
+        v = "unknown"
+    return {"version": "0.4.1-real-zk-ezkl", "ezkl": v}
 
 @app.get("/models")
 def list_models():
@@ -448,7 +474,6 @@ def list_models():
         for m in MODELS
     ]
 
-
 # =========================
 # Proof endpoints
 # =========================
@@ -460,8 +485,8 @@ def prove(req: ProveRequest):
 
     zk = ezkl_prove_real(model["model_hash"], req.features)
 
-    pred = zk.get("prediction", float("nan"))
-    if isinstance(pred, (int, float)) and (math.isnan(pred) or math.isinf(pred)):
+    pred = zk.get("prediction")
+    if pred is None or (isinstance(pred, float) and (math.isnan(pred) or math.isinf(pred))):
         pred = 0.0
 
     proof_b64 = zk["proof_b64"]
@@ -476,13 +501,14 @@ def prove(req: ProveRequest):
         public_inputs_b64=zk["public_inputs_b64"],
     )
 
-
 @app.post("/verify", response_model=VerifyResponse)
 def verify(req: VerifyRequest):
     _ = get_model(req.model_id)
-    res = ezkl_verify_real(req.proof_b64)
-    return VerifyResponse(model_id=req.model_id, valid=bool(res["valid"]), detail=res.get("detail"))
-
+    try:
+        valid = ezkl_verify_real(req.proof_b64)
+        return VerifyResponse(model_id=req.model_id, valid=bool(valid))
+    except Exception:
+        return VerifyResponse(model_id=req.model_id, valid=False)
 
 # =========================
 # Commitment endpoints
@@ -500,11 +526,6 @@ def commit(req: CommitRequest):
     commitment = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     return CommitResponse(commitment_hash=f"sha256:{commitment}")
 
-
-# =========================
-# Two-phase audit endpoints
-# =========================
-
 @app.post("/commit_case", response_model=CommitCaseResponse)
 def commit_case(req: CommitCaseRequest):
     model = get_model(req.model_id)
@@ -513,7 +534,6 @@ def commit_case(req: CommitCaseRequest):
     fh = features_hash_hex(req.features[:4])
     commitment = compute_commitment(model["model_hash"], fh, req.nonce, req.context or {})
     return CommitCaseResponse(commitment_hash=commitment, features_hash=fh)
-
 
 @app.post("/reveal", response_model=RevealResponse)
 def reveal(req: RevealRequest):
@@ -526,8 +546,8 @@ def reveal(req: RevealRequest):
 
     zk = ezkl_prove_real(model["model_hash"], req.features)
 
-    pred = zk.get("prediction", float("nan"))
-    if isinstance(pred, (int, float)) and (math.isnan(pred) or math.isinf(pred)):
+    pred = zk.get("prediction")
+    if pred is None or (isinstance(pred, float) and (math.isnan(pred) or math.isinf(pred))):
         pred = 0.0
 
     proof_b64 = zk["proof_b64"]
@@ -545,7 +565,6 @@ def reveal(req: RevealRequest):
         features_hash=fh,
     )
 
-
 # =========================
 # Admin demo controls
 # =========================
@@ -557,7 +576,6 @@ def admin_tamper_proof(req: AdminToggleRequest, x_admin_key: Optional[str] = Hea
     TAMPER_PROOF = req.enabled
     return {"tamper_proof": TAMPER_PROOF}
 
-
 @app.post("/admin/set_model_hash")
 def admin_set_model_hash(req: AdminSetModelHashRequest, x_admin_key: Optional[str] = Header(None)):
     require_admin(x_admin_key)
@@ -566,7 +584,6 @@ def admin_set_model_hash(req: AdminSetModelHashRequest, x_admin_key: Optional[st
             m["model_hash"] = req.model_hash
             return {"ok": True, "model_id": req.model_id, "model_hash": req.model_hash}
     raise HTTPException(status_code=404, detail="Unknown model_id")
-
 
 @app.post("/admin/reset_demo")
 def admin_reset_demo(x_admin_key: Optional[str] = Header(None)):
