@@ -350,22 +350,19 @@ def ezkl_prove_real(model_hash: str, features: List[float]) -> Dict[str, Any]:
         # and relies on default artifact filenames in the current working directory.
         #
         # So we copy the artifacts into this temp dir and run gen-witness there.
+        # 1) Witness (newer EZKL CLI: uses defaults in CWD; no --model / --output)
+        # Copy artifacts into the temp working dir so EZKL can find default filenames.
         (tdir / "model.onnx").write_bytes(EZKL_MODEL_ONNX.read_bytes())
         (tdir / "settings.json").write_bytes(EZKL_SETTINGS.read_bytes())
         (tdir / "model.ezkl").write_bytes(EZKL_COMPILED.read_bytes())
-
-        _run(
-            [
-                EZKL_BIN,
-                "gen-witness",
-                "--data",
-                str(input_path),
-            ],
-            cwd=tdir,
-        )
-
+        
+        # inputs already written to input_path
+        _run([EZKL_BIN, "gen-witness", "--data", str(input_path)], cwd=tdir)
+        
+        # EZKL will emit witness.json in cwd
         witness_obj = json.loads(witness_path.read_text())
         pred = _extract_prediction_from_ezkl_witness(witness_obj)
+
 
         # 2) Prove
         _run(
